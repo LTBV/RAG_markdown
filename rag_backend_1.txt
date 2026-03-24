@@ -1,0 +1,3730 @@
+"""
+RAG 系统运行入口 - 后端版（贴近原始代码风格）
+功能：
+1. Markdown智能分块
+2. 混合检索（BM25 + 向量）
+3. 索引持久化（保存 / 加载）
+4. 测试集生成（含普通题 / 消歧题 / 综合题 / 推理题 / 多跳题 / 半导体术语题 / 负样本）
+5. 测试集评估（检索 / 回答 / 分组报表）
+"""
+
+#修改增加表格、列表分割保护
+
+import os
+import sys
+import re
+import math
+import json
+import random
+import hashlib
+import numpy as np
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple
+from dataclasses import dataclass, field, asdict
+from collections import Counter, defaultdict
+import requests
+from dotenv import load_dotenv
+import torch
+from transformers import AutoTokenizer, AutoModel
+
+
+# ============================================================
+# 配置区域
+# ============================================================
+load_dotenv()
+
+# API 配置
+#EMBEDDING_URL = os.environ.get("EMBEDDING_URL")
+#EMBEDDING_KEY = os.environ.get("EMBEDDING_KEY")
+LOCAL_EMBEDDING_PATH = os.environ.get("LOCAL_EMBEDDING_PATH", "D:\learning\rag_testset\models\bge-m3")
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-m3")
+EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM", "1024"))
+EMBEDDING_DEVICE = os.environ.get(
+    "EMBEDDING_DEVICE",
+    "cuda" if torch.cuda.is_available() else "cpu"
+    )
+EMBEDDING_MAX_LENGTH = int(os.environ.get("EMBEDDING_MAX_LENGTH", "512"))
+EMBEDDING_BATCH_SIZE = int(os.environ.get("EMBEDDING_BATCH_SIZE", "8"))
+
+LLM_URL = os.environ.get("LLM_URL")
+LLM_KEY = os.environ.get("LLM_KEY")
+LLM_MODEL = os.environ.get("LLM_MODEL", "abyss/abyss-chat")
+
+# 知识库配置
+CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "512"))
+CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "50"))
+TOP_K = int(os.environ.get("TOP_K", "10"))
+
+# 混合检索权重配置
+VECTOR_WEIGHT = float(os.environ.get("VECTOR_WEIGHT", "0.6"))
+BM25_WEIGHT = float(os.environ.get("BM25_WEIGHT", "0.4"))
+
+# 知识源
+_default_knowledge = os.environ.get("KNOWLEDGE_SOURCE", "D:/my_work/仓库_新/Requirements Library")
+KNOWLEDGE_SOURCE = [p.strip() for p in _default_knowledge.split("||") if p.strip()]
+
+KB_SAVE_PATH = os.environ.get("KB_SAVE_PATH")
+DEBUG = os.environ.get("DEBUG", "true").lower() in {"1", "true", "yes", "y"}
+
+DEFAULT_REFUSAL_ANSWER = "根据提供的文档，没有找到相关信息。"
+
+MIN_CHUNK_CHARS = int(os.environ.get("MIN_CHUNK_CHARS", "80"))
+
+# ============================================================
+# 工具函数
+# ============================================================
+def normalize_text(text: str) -> str:
+    if not text:
+        return ""
+    text = text.lower().strip()
+    text = re.sub(r"\s+", "", text)
+    text = re.sub(r"[，。！？；：、,.!?;:\"'“”‘’（）()\[\]【】{}<>《》]", "", text)
+    return text
+
+
+def first_header_line(header_context: str, max_len: int = 120) -> str:
+    if not header_context:
+        return "(无章节)"
+    line = header_context.splitlines()[0].strip() if header_context.splitlines() else "(无章节)"
+    if len(line) > max_len:
+        line = line[:max_len - 3] + "..."
+    return line or "(无章节)"
+
+
+def sort_metric_dict(data: Dict[str, Dict], primary_key: str = "count") -> Dict[str, Dict]:
+    items = sorted(data.items(), key=lambda kv: (-kv[1].get(primary_key, 0), kv[0]))
+    return {k: v for k, v in items}
+
+
+def get_case_gold_sources(tc) -> List[Dict]:
+    if getattr(tc, "gold_sources", None):
+        return tc.gold_sources
+    if getattr(tc, "source_path", "") and getattr(tc, "source_chunk_id", -1) >= 0:
+        return [{
+            "source_doc": tc.source_doc,
+            "source_path": tc.source_path,
+            "chunk_id": tc.source_chunk_id,
+            "header": tc.source_header,
+            "role": "primary"
+        }]
+    return []
+
+
+def get_case_doc_group(tc) -> str:
+    golds = get_case_gold_sources(tc)
+    if not golds:
+        return getattr(tc, "origin_doc", "") or "(未知来源)"
+    docs = sorted({g.get("source_doc", "(未知文档)") for g in golds})
+    if len(docs) == 1:
+        return docs[0]
+    label = "MULTI::" + " | ".join(docs[:3])
+    if len(docs) > 3:
+        label += " ..."
+    return label
+
+
+def get_case_header_group(tc) -> str:
+    golds = get_case_gold_sources(tc)
+    if not golds:
+        return f"{getattr(tc, 'origin_doc', '(未知来源)')} :: {first_header_line(getattr(tc, 'origin_header', ''), 80)}"
+    if len(golds) == 1:
+        g = golds[0]
+        return f"{g.get('source_doc', '(未知文档)')} :: {first_header_line(g.get('header', ''), 80)}"
+
+    parts = []
+    for g in golds[:3]:
+        parts.append(f"{g.get('source_doc', '(未知文档)')}::{first_header_line(g.get('header', ''), 50)}")
+    label = "MULTI::" + " | ".join(parts)
+    if len(golds) > 3:
+        label += " ..."
+    return label
+
+# ============================================================
+# 数据类
+# ============================================================
+@dataclass
+class Document:
+    content: str
+    metadata: Dict = None
+
+    def __post_init__(self):
+        if self.metadata is None:
+            self.metadata = {}
+
+
+@dataclass
+class Chunk:
+    content: str
+    metadata: Dict
+    doc_id: str
+    chunk_id: int
+    # 保存分块的标题上下文
+    header_context: str = ""
+
+
+@dataclass
+class SearchResult:
+    chunk: Chunk
+    score: float
+    # 分数来源详情
+    vector_score: float = 0.0
+    bm25_score: float = 0.0
+
+
+@dataclass
+class TestCase:
+    case_id: str
+    question: str
+    expected_behavior: str = "answer"   # answer | refuse
+    expected_answer: str = ""
+    evidence: str = ""
+    case_type: str = "factoid"
+    difficulty: str = "medium"
+
+    source_doc: str = ""
+    source_path: str = ""
+    source_chunk_id: int = -1
+    source_header: str = ""
+
+    origin_doc: str = ""
+    origin_path: str = ""
+    origin_chunk_id: int = -1
+    origin_header: str = ""
+
+    # 多证据源
+    gold_sources: List[Dict] = field(default_factory=list)
+
+    # 额外标签
+    tags: List[str] = field(default_factory=list)
+
+# ============================================================
+# Markdown 智能分块器
+# ============================================================
+class MarkdownChunker:
+    """
+    Markdown 感知分块器（增强版）
+    修复点：
+    1. 表格保护：表题/表格/表注绑定；大表拆分时重复表头
+    2. 列表保护：列表引导语/列表项/缩进续行绑定；大列表按 item 拆分
+    3. 标题切分时忽略 fenced code，避免代码块里的 # 被误识别为标题
+    4. 过滤伪空白；仅合并普通短块，不合并表格/列表/代码块
+    """
+
+    def __init__(self, chunk_size: int = 512, chunk_overlap: int = 50, min_chunk_chars: int = 80):
+        self.chunk_size = chunk_size
+        self.chunk_overlap = min(chunk_overlap, chunk_size // 4)
+        self.min_chunk_chars = max(20, min_chunk_chars)
+        self.max_merge_size = int(chunk_size * 1.35)
+
+        # 标题
+        self.header_pattern = re.compile(r'^\s{0,3}(#{1,6})\s+(.+?)\s*$')
+
+        # fenced code
+        self.fence_pattern = re.compile(r'^\s*([`~]{3,})(.*)$')
+
+        # 列表
+        self.list_pattern = re.compile(
+            r'^\s*(?:'
+            r'[-*+]\s+(?:\[[ xX]\]\s+)?'      # - item / - [x] item
+            r'|\d+[.)]\s+'                    # 1. item / 1) item
+            r'|[（(]?\d+[）)]\s*'             # （1）item / (1) item
+            r'|[a-zA-Z][.)]\s+'               # a. item / A) item
+            r'|[一二三四五六七八九十]+[、.]\s*'  # 一、说明
+            r')'
+        )
+
+        # 表格
+        self.table_sep_pattern = re.compile(
+            r'^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$'
+        )
+
+        # 图片/媒体
+        self.md_image_pattern = re.compile(r'!\[[^\]]*\]\([^)]+\)')
+        self.md_ref_image_use_pattern = re.compile(r'!\[[^\]]*\]\[[^\]]+\]')
+        self.md_ref_def_pattern = re.compile(r'^\s*\[[^\]]+\]:\s+\S+.*$')
+        self.html_img_pattern = re.compile(r'<img\b[^>]*>', re.IGNORECASE)
+
+        # 伪空白
+        self.html_comment_pattern = re.compile(r'<!--[\s\S]*?-->')
+        self.anchor_pattern = re.compile(
+            r'^\s*(<a\b[^>]*>\s*</a>|<a\b[^>]*/?>)\s*$',
+            re.IGNORECASE
+        )
+        self.separator_pattern = re.compile(r'^\s*([-*_])(?:\s*\1){2,}\s*$')
+
+        # 说明/注释
+        self.note_pattern = re.compile(
+            r'^\s*(注[:：]|备注[:：]|说明[:：]|注意[:：]|note[:：]|tips?[:：])',
+            re.IGNORECASE
+        )
+
+    # =========================================================
+    # 对外入口
+    # =========================================================
+    def split(self, text: str, metadata: Dict = None) -> List[Tuple[str, str]]:
+        """
+        智能分割 Markdown 文档
+        返回: List[(chunk_content, header_context)]
+        """
+        if not text or not text.strip():
+            return []
+
+        sections = self._split_by_headers(text)
+        chunks = []
+
+        for header, content in sections:
+            if not content.strip():
+                continue
+
+            section_text = f"{header}\n{content}".strip() if header else content.strip()
+            body = self._strip_header_prefix(section_text, header)
+            if not body or self._is_semantic_empty_text(body):
+                continue
+
+            if len(section_text) <= self.chunk_size:
+                chunks.append((section_text, header))
+            else:
+                chunks.extend(self._split_large_section(content, header))
+
+        return self._post_process_chunks(chunks)
+
+    # =========================================================
+    # 标题切分：忽略 fenced code
+    # =========================================================
+    def _split_by_headers(self, text: str) -> List[Tuple[str, str]]:
+        lines = text.split('\n')
+        sections = []
+        current_headers = {}
+        current_content = []
+        current_header = ""
+
+        in_code = False
+        current_fence = None
+
+        for line in lines:
+            if not in_code and self._is_fence_start(line):
+                in_code = True
+                current_fence = self._get_fence_marker(line)
+                current_content.append(line)
+                continue
+
+            if in_code:
+                current_content.append(line)
+                if self._is_fence_close(line, current_fence):
+                    in_code = False
+                    current_fence = None
+                continue
+
+            header_match = self.header_pattern.match(line)
+            if header_match:
+                if current_content or current_header:
+                    content = '\n'.join(current_content).strip()
+                    sections.append((current_header, content))
+
+                level = len(header_match.group(1))
+                header_text = line.strip()
+
+                for l in list(current_headers.keys()):
+                    if l >= level:
+                        del current_headers[l]
+
+                current_headers[level] = header_text
+                header_context_parts = [current_headers[l] for l in sorted(current_headers.keys())]
+                current_header = '\n'.join(header_context_parts)
+                current_content = []
+            else:
+                current_content.append(line)
+
+        if current_content or current_header:
+            content = '\n'.join(current_content).strip()
+            sections.append((current_header, content))
+
+        return sections if sections else [("", text)]
+
+    # =========================================================
+    # 大 section 分块
+    # =========================================================
+    def _split_large_section(self, content: str, header: str) -> List[Tuple[str, str]]:
+        chunks = []
+        current_chunk = ""
+        header_prefix = f"{header}\n\n" if header else ""
+
+        blocks = self._extract_semantic_blocks(content)
+
+        for block in blocks:
+            block_text = block["text"].strip()
+            block_type = block["type"]
+
+            if not block_text or self._is_semantic_empty_text(block_text):
+                continue
+
+            # 结构块单独保护
+            if block_type == "code":
+                if current_chunk.strip():
+                    chunks.append(((header_prefix + current_chunk.strip()).strip(), header))
+                    current_chunk = ""
+
+                code_chunk = (header_prefix + block_text).strip()
+                if len(code_chunk) <= self.chunk_size * 1.5:
+                    chunks.append((code_chunk, header))
+                else:
+                    chunks.extend(self._force_split_code(block_text, header))
+                continue
+
+            if block_type == "table":
+                if current_chunk.strip():
+                    chunks.append(((header_prefix + current_chunk.strip()).strip(), header))
+                    current_chunk = ""
+
+                table_chunk = (header_prefix + block_text).strip()
+                if len(table_chunk) <= self.chunk_size * 1.5:
+                    chunks.append((table_chunk, header))
+                else:
+                    chunks.extend(self._split_large_table(block_text, header))
+                continue
+
+            if block_type == "list":
+                if current_chunk.strip():
+                    chunks.append(((header_prefix + current_chunk.strip()).strip(), header))
+                    current_chunk = ""
+
+                list_chunk = (header_prefix + block_text).strip()
+                if len(list_chunk) <= self.chunk_size * 1.5:
+                    chunks.append((list_chunk, header))
+                else:
+                    chunks.extend(self._split_large_list(block_text, header))
+                continue
+
+            # 普通段落：尽量合并
+            test_chunk = current_chunk + "\n\n" + block_text if current_chunk else block_text
+            if len(header_prefix + test_chunk) > self.chunk_size:
+                if current_chunk.strip():
+                    chunks.append(((header_prefix + current_chunk.strip()).strip(), header))
+                current_chunk = block_text
+            else:
+                current_chunk = test_chunk
+
+        if current_chunk.strip():
+            chunks.append(((header_prefix + current_chunk.strip()).strip(), header))
+
+        if not chunks:
+            fallback = (header_prefix + content).strip()
+            return [(fallback, header)] if fallback else []
+
+        return chunks
+
+    # =========================================================
+    # 原始 block 切分
+    # =========================================================
+    def _split_raw_blocks(self, text: str) -> List[str]:
+        """
+        按空行切 block，但 fenced code 单独保护，不在 code 内继续切。
+        """
+        lines = text.splitlines()
+        blocks = []
+        buf = []
+
+        def flush():
+            nonlocal buf
+            block = "\n".join(buf).strip("\n")
+            if block.strip():
+                blocks.append(block)
+            buf = []
+
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+
+            if self._is_fence_start(line):
+                flush()
+                marker = self._get_fence_marker(line)
+                code_buf = [line]
+                i += 1
+                while i < len(lines):
+                    code_buf.append(lines[i])
+                    if self._is_fence_close(lines[i], marker):
+                        i += 1
+                        break
+                    i += 1
+                block = "\n".join(code_buf).strip("\n")
+                if block.strip():
+                    blocks.append(block)
+                continue
+
+            if not line.strip():
+                flush()
+                i += 1
+                continue
+
+            buf.append(line.rstrip())
+            i += 1
+
+        flush()
+        return blocks
+
+    def _extract_semantic_blocks(self, content: str) -> List[Dict]:
+        raw_blocks = self._split_raw_blocks(content)
+
+        exploded = []
+        for block in raw_blocks:
+            exploded.extend(self._explode_mixed_block(block))
+
+        typed = []
+        for text in exploded:
+            text = (text or "").strip()
+            if not text:
+                continue
+            if self._is_semantic_empty_text(text):
+                continue
+            typed.append({
+                "type": self._detect_block_type(text),
+                "text": text
+            })
+
+        return self._merge_semantic_blocks(typed)
+
+    def _explode_mixed_block(self, block: str) -> List[str]:
+        """
+        把“普通段 + 表格”或“普通段 + 列表”混合 block 拆开。
+        例如：
+        参数如下：
+        |a|b|
+
+        或：
+        支持以下项：
+        - a
+        - b
+        """
+        parts = [block]
+
+        for _ in range(4):  # 最多递归拆 4 轮，避免异常循环
+            changed = False
+            new_parts = []
+
+            for part in parts:
+                if self._is_fenced_code_block(part):
+                    new_parts.append(part.strip())
+                    continue
+
+                split_table = self._split_mixed_table_block(part)
+                if len(split_table) > 1:
+                    new_parts.extend(split_table)
+                    changed = True
+                    continue
+
+                split_list = self._split_mixed_list_block(part)
+                if len(split_list) > 1:
+                    new_parts.extend(split_list)
+                    changed = True
+                    continue
+
+                new_parts.append(part.strip())
+
+            parts = [p for p in new_parts if p and p.strip()]
+            if not changed:
+                break
+
+        return parts
+
+    # =========================================================
+    # 混合块拆分：表格
+    # =========================================================
+    def _split_mixed_table_block(self, text: str) -> List[str]:
+        lines = [l.rstrip() for l in text.splitlines()]
+        table_range = self._find_table_range(lines)
+        if not table_range:
+            return [text.strip()] if text.strip() else []
+
+        start, end = table_range
+
+        before_lines = lines[:start]
+        table_lines = lines[start:end]
+        after_lines = lines[end:]
+
+        before_main, ctx_lines = self._detach_trailing_context(
+            before_lines, self._is_table_context_paragraph, max_lines=3
+        )
+
+        parts = []
+        for group in (before_main, ctx_lines, table_lines, after_lines):
+            block = "\n".join(group).strip()
+            if block:
+                parts.append(block)
+
+        return parts if parts else [text.strip()]
+
+    # =========================================================
+    # 混合块拆分：列表
+    # =========================================================
+    def _split_mixed_list_block(self, text: str) -> List[str]:
+        lines = [l.rstrip() for l in text.splitlines()]
+        start = self._find_list_start(lines)
+        if start is None or start == 0:
+            return [text.strip()] if text.strip() else []
+
+        list_text = "\n".join(lines[start:]).strip()
+        # 只有尾部真的像一个列表块时，才拆
+        if not self._is_list_block(list_text):
+            return [text.strip()] if text.strip() else []
+
+        before_lines = lines[:start]
+        before_main, ctx_lines = self._detach_trailing_context(
+            before_lines, self._is_list_context_paragraph, max_lines=3
+        )
+
+        parts = []
+        before_text = "\n".join(before_main).strip()
+        ctx_text = "\n".join(ctx_lines).strip()
+
+        if before_text:
+            parts.append(before_text)
+        if ctx_text:
+            parts.append(ctx_text)
+        if list_text:
+            parts.append(list_text)
+
+        return parts if parts else [text.strip()]
+
+    # =========================================================
+    # 合并结构块上下文
+    # =========================================================
+    def _merge_semantic_blocks(self, blocks: List[Dict]) -> List[Dict]:
+        merged = []
+        i = 0
+
+        while i < len(blocks):
+            cur = blocks[i]
+            cur_type = cur["type"]
+            cur_text = cur["text"].strip()
+
+            # 表格：吸附前文表题 / 后文表注
+            if cur_type == "table":
+                context_parts = []
+                while merged and merged[-1]["type"] == "para" and self._is_table_context_paragraph(merged[-1]["text"]):
+                    context_parts.append(merged.pop()["text"].strip())
+                    if len(context_parts) >= 2:
+                        break
+
+                if context_parts:
+                    cur_text = "\n\n".join(list(reversed(context_parts)) + [cur_text])
+
+                j = i + 1
+                while j < len(blocks):
+                    nxt = blocks[j]
+                    if nxt["type"] == "para" and self._is_table_note_paragraph(nxt["text"]):
+                        cur_text = cur_text.rstrip() + "\n\n" + nxt["text"].strip()
+                        j += 1
+                        continue
+                    break
+
+                merged.append({"type": "table", "text": cur_text})
+                i = j
+                continue
+
+            # 列表：吸附前文引导语 / 缩进续行 / 后文说明
+            if cur_type == "list":
+                context_parts = []
+                while merged and merged[-1]["type"] == "para" and self._is_list_context_paragraph(merged[-1]["text"]):
+                    context_parts.append(merged.pop()["text"].strip())
+                    if len(context_parts) >= 2:
+                        break
+
+                if context_parts:
+                    cur_text = "\n\n".join(list(reversed(context_parts)) + [cur_text])
+
+                j = i + 1
+                while j < len(blocks):
+                    nxt = blocks[j]
+
+                    # 空隔开的缩进续行，继续吸到列表中
+                    if nxt["type"] == "para" and self._is_list_continuation_paragraph(nxt["text"]):
+                        cur_text = cur_text.rstrip() + "\n\n" + nxt["text"].strip()
+                        j += 1
+                        continue
+
+                    # 列表说明 / 注意事项
+                    if nxt["type"] == "para" and self._is_list_note_paragraph(nxt["text"]):
+                        cur_text = cur_text.rstrip() + "\n\n" + nxt["text"].strip()
+                        j += 1
+                        continue
+
+                    # 紧邻的第二段列表，也归并成一个列表块
+                    if nxt["type"] == "list":
+                        cur_text = cur_text.rstrip() + "\n\n" + nxt["text"].strip()
+                        j += 1
+                        continue
+
+                    break
+
+                merged.append({"type": "list", "text": cur_text})
+                i = j
+                continue
+
+            merged.append(cur)
+            i += 1
+
+        return merged
+
+    # =========================================================
+    # fenced code helpers
+    # =========================================================
+    def _is_fence_start(self, line: str) -> bool:
+        return bool(self.fence_pattern.match(line))
+
+    def _get_fence_marker(self, line: str) -> Optional[str]:
+        m = self.fence_pattern.match(line)
+        return m.group(1) if m else None
+
+    def _is_fence_close(self, line: str, marker: Optional[str]) -> bool:
+        if not marker:
+            return False
+        s = line.lstrip()
+        ch = marker[0]
+        return bool(re.match(rf'^{re.escape(ch)}{{{len(marker)},}}\s*$', s))
+
+    def _is_fenced_code_block(self, text: str) -> bool:
+        lines = text.splitlines()
+        if len(lines) < 2:
+            return False
+        marker = self._get_fence_marker(lines[0])
+        if not marker:
+            return False
+        return self._is_fence_close(lines[-1], marker)
+
+    # =========================================================
+    # 表格识别
+    # =========================================================
+    def _looks_like_table_row(self, line: str) -> bool:
+        s = line.strip()
+        if not s or "|" not in s:
+            return False
+        cells = [c.strip() for c in s.strip("|").split("|")]
+        return len(cells) >= 2 and any(c != "" for c in cells)
+
+    def _is_table_separator(self, line: str) -> bool:
+        return bool(self.table_sep_pattern.match(line.strip()))
+
+    def _find_table_range(self, lines: List[str]) -> Optional[Tuple[int, int]]:
+        for i in range(len(lines) - 1):
+            if self._looks_like_table_row(lines[i]) and self._is_table_separator(lines[i + 1]):
+                j = i + 2
+                while j < len(lines) and self._looks_like_table_row(lines[j]):
+                    j += 1
+                return i, j
+        return None
+
+    def _is_table_context_paragraph(self, text: str) -> bool:
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        if not lines or len(lines) > 3:
+            return False
+
+        joined = " ".join(lines)
+        if len(joined) > 140:
+            return False
+
+        low = joined.lower()
+        if re.search(r'(表\s*\d+|如下表|见下表|参数表|字段说明|列说明|配置项|对比表|映射表|table)', low, re.I):
+            return True
+
+        if joined.endswith(("：", ":")) and re.search(r'(参数|字段|列|配置|对比|映射|如下|见下)', joined):
+            return True
+
+        return False
+
+    def _is_table_note_paragraph(self, text: str) -> bool:
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        if not lines or len(lines) > 4:
+            return False
+        return all(self.note_pattern.match(line) for line in lines)
+
+    def _is_table_block(self, text: str) -> bool:
+        lines = [l.rstrip() for l in text.splitlines() if l.strip()]
+        if len(lines) < 2:
+            return False
+
+        table_range = self._find_table_range(lines)
+        if not table_range:
+            return False
+
+        start, end = table_range
+        prefix = "\n".join(lines[:start]).strip()
+        suffix = "\n".join(lines[end:]).strip()
+
+        if prefix and not self._is_table_context_paragraph(prefix):
+            return False
+        if suffix and not self._is_table_note_paragraph(suffix):
+            return False
+
+        return True
+
+    def _extract_table_components(self, text: str) -> Tuple[List[str], List[str], List[str]]:
+        lines = [l.rstrip() for l in text.splitlines()]
+        table_range = self._find_table_range(lines)
+        if not table_range:
+            return [], [l for l in lines if l.strip()], []
+
+        start, end = table_range
+        prefix_lines = [l for l in lines[:start] if l.strip()]
+        table_lines = [l for l in lines[start:end] if l.strip()]
+        suffix_lines = [l for l in lines[end:] if l.strip()]
+        return prefix_lines, table_lines, suffix_lines
+
+    # =========================================================
+    # 列表识别
+    # =========================================================
+    def _leading_spaces(self, line: str) -> int:
+        return len(line) - len(line.lstrip(' '))
+
+    def _is_list_item_start(self, line: str) -> bool:
+        return bool(self.list_pattern.match(line))
+
+    def _find_list_start(self, lines: List[str]) -> Optional[int]:
+        for i, line in enumerate(lines):
+            if self._is_list_item_start(line):
+                return i
+        return None
+
+    def _is_list_context_paragraph(self, text: str) -> bool:
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        if not lines or len(lines) > 3:
+            return False
+
+        joined = " ".join(lines)
+        if len(joined) > 160:
+            return False
+
+        if joined.endswith(("：", ":")):
+            return True
+
+        if re.search(r'(如下|包括|支持|可选|步骤|流程|参数|方式|清单|列表|注意事项|要求|包含|分为)', joined):
+            return True
+
+        return False
+
+    def _is_list_note_paragraph(self, text: str) -> bool:
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        if not lines or len(lines) > 4:
+            return False
+        return all(self.note_pattern.match(line) for line in lines)
+
+    def _is_list_continuation_paragraph(self, text: str) -> bool:
+        lines = [l for l in text.splitlines() if l.strip()]
+        if not lines:
+            return False
+
+        # 整段都有缩进，通常是上一个列表项的续行
+        if all(self._leading_spaces(line) >= 2 for line in lines):
+            return True
+
+        # 嵌套列表
+        if self._is_list_item_start(lines[0]) and self._leading_spaces(lines[0]) >= 2:
+            return True
+
+        return False
+
+    def _extract_list_items(self, text: str) -> Tuple[List[str], List[str]]:
+        """
+        返回: (prefix_lines, items)
+        prefix_lines: 列表前引导语
+        items: 按顶层 item 分组后的列表项文本
+        """
+        lines = text.splitlines()
+        start = self._find_list_start(lines)
+        if start is None:
+            return [l for l in lines if l.strip()], []
+
+        prefix_lines = [l for l in lines[:start] if l.strip()]
+        list_lines = lines[start:]
+
+        if not list_lines:
+            return prefix_lines, []
+
+        base_indent = self._leading_spaces(list_lines[0])
+        items = []
+        current = []
+
+        for line in list_lines:
+            if self._is_list_item_start(line) and self._leading_spaces(line) <= base_indent:
+                if current:
+                    items.append("\n".join(current).rstrip())
+                current = [line]
+            else:
+                current.append(line)
+
+        if current:
+            items.append("\n".join(current).rstrip())
+
+        items = [item.strip("\n") for item in items if item.strip()]
+        return prefix_lines, items
+
+    def _is_list_block(self, text: str) -> bool:
+        lines = [l.rstrip() for l in text.splitlines() if l.strip()]
+        if not lines:
+            return False
+
+        start = self._find_list_start(lines)
+        if start is None:
+            return False
+
+        prefix = "\n".join(lines[:start]).strip()
+        if prefix and not self._is_list_context_paragraph(prefix):
+            return False
+
+        _, items = self._extract_list_items("\n".join(lines))
+        if len(items) >= 2:
+            return True
+
+        if len(items) == 1:
+            # 单个 item，但有多行内容，也视为列表块
+            return "\n" in items[0]
+
+        return False
+
+    # =========================================================
+    # 统一类型判断
+    # =========================================================
+    def _detect_block_type(self, text: str) -> str:
+        if self._is_fenced_code_block(text):
+            return "code"
+        if self._is_table_block(text):
+            return "table"
+        if self._is_list_block(text):
+            return "list"
+        if self._is_media_paragraph(text):
+            return "media"
+        return "para"
+
+    def _is_structured_block(self, text: str) -> bool:
+        t = (text or "").strip()
+        if not t:
+            return False
+        return (
+            self._is_fenced_code_block(t) or
+            self._is_table_block(t) or
+            self._is_list_block(t)
+        )
+
+    # =========================================================
+    # 大表拆分：重复列头
+    # =========================================================
+    def _split_large_table(self, table_block: str, header: str) -> List[Tuple[str, str]]:
+        prefix_lines, table_lines, suffix_lines = self._extract_table_components(table_block)
+        header_prefix = f"{header}\n\n" if header else ""
+
+        if len(table_lines) < 2:
+            text = (header_prefix + table_block).strip()
+            return [(text, header)] if text else []
+
+        head_row = table_lines[0]
+        sep_row = table_lines[1]
+        data_rows = table_lines[2:]
+
+        prefix_text = "\n".join(prefix_lines).strip()
+        suffix_text = "\n".join(suffix_lines).strip()
+
+        # 没有数据行，直接返回
+        if not data_rows:
+            body_parts = []
+            if prefix_text:
+                body_parts.append(prefix_text)
+            body_parts.append("\n".join(table_lines))
+            if suffix_text:
+                body_parts.append(suffix_text)
+            body = "\n\n".join(body_parts).strip()
+            return [((header_prefix + body).strip(), header)] if body else []
+
+        chunks = []
+        current_rows = []
+
+        def make_body(rows: List[str], attach_suffix: bool = False) -> str:
+            table_body = "\n".join([head_row, sep_row] + rows).strip()
+            parts = []
+            if prefix_text:
+                parts.append(prefix_text)
+            parts.append(table_body)
+            if attach_suffix and suffix_text:
+                parts.append(suffix_text)
+            return "\n\n".join(parts).strip()
+
+        for row in data_rows:
+            candidate_rows = current_rows + [row]
+            candidate_body = make_body(candidate_rows, attach_suffix=False)
+
+            if len(header_prefix + candidate_body) > self.chunk_size and current_rows:
+                body = make_body(current_rows, attach_suffix=False)
+                chunks.append(((header_prefix + body).strip(), header))
+                current_rows = [row]
+            else:
+                current_rows = candidate_rows
+
+        if current_rows:
+            body = make_body(current_rows, attach_suffix=True)
+            chunks.append(((header_prefix + body).strip(), header))
+
+        return chunks
+
+    # =========================================================
+    # 大列表拆分：按 item 拆，重复引导语
+    # =========================================================
+    def _split_large_list(self, list_block: str, header: str) -> List[Tuple[str, str]]:
+        prefix_lines, items = self._extract_list_items(list_block)
+        header_prefix = f"{header}\n\n" if header else ""
+
+        if not items:
+            text = (header_prefix + list_block).strip()
+            return [(text, header)] if text else []
+
+        prefix_text = "\n".join(prefix_lines).strip()
+        chunks = []
+        current_items = []
+
+        def make_body(item_list: List[str]) -> str:
+            parts = []
+            if prefix_text:
+                parts.append(prefix_text)
+            parts.append("\n\n".join(item_list).strip())
+            return "\n\n".join([p for p in parts if p]).strip()
+
+        for item in items:
+            candidate_items = current_items + [item]
+            candidate_body = make_body(candidate_items)
+
+            if len(header_prefix + candidate_body) > self.chunk_size and current_items:
+                body = make_body(current_items)
+                chunks.append(((header_prefix + body).strip(), header))
+                current_items = [item]
+            else:
+                current_items = candidate_items
+
+        if current_items:
+            body = make_body(current_items)
+            chunks.append(((header_prefix + body).strip(), header))
+
+        return chunks
+
+    # =========================================================
+    # 大代码块拆分（保留 fenced code 结构）
+    # =========================================================
+    def _force_split_code(self, code_block: str, header: str) -> List[Tuple[str, str]]:
+        header_prefix = f"{header}\n\n" if header else ""
+
+        if not self._is_fenced_code_block(code_block):
+            text = code_block.strip()
+            if not text:
+                return []
+            return [((header_prefix + text).strip(), header)]
+
+        lines = code_block.splitlines()
+        opening = lines[0].rstrip()
+        marker = self._get_fence_marker(opening)
+        closing = marker if marker else "```"
+        content_lines = lines[1:-1]
+
+        chunks = []
+        current = []
+
+        def make_code_body(code_lines: List[str]) -> str:
+            return "\n".join([opening] + code_lines + [closing]).strip()
+
+        for line in content_lines:
+            candidate = make_code_body(current + [line])
+            if len(header_prefix + candidate) > self.chunk_size and current:
+                chunks.append(((header_prefix + make_code_body(current)).strip(), header))
+                current = [line]
+            else:
+                current.append(line)
+
+        if current:
+            chunks.append(((header_prefix + make_code_body(current)).strip(), header))
+
+        return chunks if chunks else [((header_prefix + code_block).strip(), header)]
+
+    # =========================================================
+    # 上下文行拆分辅助
+    # =========================================================
+    def _detach_trailing_context(self, lines: List[str], judge_func, max_lines: int = 3) -> Tuple[List[str], List[str]]:
+        if not lines:
+            return [], []
+
+        best_split = len(lines)
+        lower_bound = max(0, len(lines) - max_lines)
+
+        for i in range(len(lines) - 1, lower_bound - 1, -1):
+            candidate = "\n".join([l for l in lines[i:] if l.strip()]).strip()
+            if candidate and judge_func(candidate):
+                best_split = i
+            else:
+                break
+
+        return lines[:best_split], lines[best_split:]
+
+    # =========================================================
+    # 其它辅助
+    # =========================================================
+    def _is_media_paragraph(self, text: str) -> bool:
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        if not lines:
+            return False
+
+        def is_media_line(line: str) -> bool:
+            return bool(
+                self.md_image_pattern.fullmatch(line) or
+                self.md_ref_image_use_pattern.fullmatch(line) or
+                self.md_ref_def_pattern.fullmatch(line) or
+                self.html_img_pattern.fullmatch(line)
+            )
+
+        return all(is_media_line(line) for line in lines)
+
+    def _is_semantic_empty_text(self, text: str) -> bool:
+        if not text or not text.strip():
+            return True
+
+        t = self.html_comment_pattern.sub("", text).strip()
+        if not t:
+            return True
+
+        lines = [l.strip() for l in t.splitlines() if l.strip()]
+        if not lines:
+            return True
+
+        if all(self.separator_pattern.fullmatch(line) for line in lines):
+            return True
+
+        if all(self.anchor_pattern.fullmatch(line) for line in lines):
+            return True
+
+        return False
+
+    def _strip_header_prefix(self, content: str, header: str) -> str:
+        text = (content or "").strip()
+        h = (header or "").strip()
+        if h and text.startswith(h):
+            return text[len(h):].strip()
+        return text
+
+    # =========================================================
+    # 后处理：只合并普通短块，不合并结构块
+    # =========================================================
+    def _post_process_chunks(self, chunks: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+        cleaned = []
+
+        for content, header in chunks:
+            text = (content or "").strip()
+            if not text:
+                continue
+
+            body = self._strip_header_prefix(text, header)
+            if not body or self._is_semantic_empty_text(body):
+                continue
+
+            if cleaned:
+                prev_content, prev_header = cleaned[-1]
+                prev_body = self._strip_header_prefix(prev_content, prev_header)
+
+                short_prev = len(prev_body) < self.min_chunk_chars
+                short_curr = len(body) < self.min_chunk_chars
+                same_header = (prev_header == header)
+
+                structured_prev = self._is_structured_block(prev_body)
+                structured_curr = self._is_structured_block(body)
+
+                merged_body = (prev_body.rstrip() + "\n\n" + body.lstrip()).strip()
+                merged_text = f"{header}\n\n{merged_body}".strip() if header else merged_body
+
+                if (
+                    same_header and
+                    not structured_prev and
+                    not structured_curr and
+                    (short_prev or short_curr) and
+                    len(merged_text) <= self.max_merge_size
+                ):
+                    cleaned[-1] = (merged_text, header)
+                    continue
+
+            cleaned.append((text, header))
+
+        return cleaned
+
+# ============================================================
+# BM25 关键词检索器
+# ============================================================
+class BM25Retriever:
+    """BM25关键词检索实现"""
+
+    def __init__(self, k1: float = 1.5, b: float = 0.75):
+        self.k1 = k1
+        self.b = b
+        self.corpus_tokens: List[List[str]] = []
+        self.doc_freqs: List[Counter] = []
+        self.idf: Dict[str, float] = {}
+        self.doc_lens: List[int] = []
+        self.avgdl: float = 0
+        self.N: int = 0
+
+        self.stopwords = set([
+            '的', '是', '在', '了', '和', '与', '或', '等', '这', '那', '有',
+            '个', '为', '中', '上', '下', '到', '从', '被', '把', '让', '给',
+            'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
+            'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
+            'would', 'could', 'should', 'may', 'might', 'must', 'shall',
+            'of', 'to', 'in', 'for', 'on', 'with', 'at', 'by', 'from',
+            'as', 'into', 'through', 'during', 'before', 'after', 'and',
+            'or', 'but', 'if', 'because', 'while', 'although', 'this',
+            'that', 'these', 'those', 'it', 'its'
+        ])
+
+    def tokenize(self, text: str) -> List[str]:
+        """分词：中文按字/词，英文按词"""
+        text = text.lower()
+        tokens = []
+
+        words = re.findall(r'[a-zA-Z][a-zA-Z0-9_\-]*', text)
+        tokens.extend([w for w in words if w not in self.stopwords and len(w) > 1])
+
+        chinese_segments = re.findall(r'[\u4e00-\u9fff]+', text)
+        for seg in chinese_segments:
+            if len(seg) > 1 and seg not in self.stopwords:
+                tokens.append(seg)
+            for char in seg:
+                if char not in self.stopwords:
+                    tokens.append(char)
+
+        return tokens
+
+    def fit(self, documents: List[str]):
+        """构建BM25索引"""
+        self.corpus_tokens = []
+        self.doc_freqs = []
+        self.doc_lens = []
+        df_counter = Counter()
+
+        for doc in documents:
+            tokens = self.tokenize(doc)
+            self.corpus_tokens.append(tokens)
+            self.doc_lens.append(len(tokens))
+
+            freq = Counter(tokens)
+            self.doc_freqs.append(freq)
+
+            for token in set(tokens):
+                df_counter[token] += 1
+
+        self.N = len(documents)
+        self.avgdl = sum(self.doc_lens) / self.N if self.N > 0 else 0
+
+        self.idf = {}
+        for token, freq in df_counter.items():
+            self.idf[token] = math.log((self.N - freq + 0.5) / (freq + 0.5) + 1)
+
+        if DEBUG:
+            print(f"  BM25索引: {self.N} 文档, {len(self.idf)} 词汇")
+
+    def search(self, query: str, top_k: int = 10) -> List[Tuple[int, float]]:
+        """BM25搜索"""
+        if not self.corpus_tokens:
+            return []
+
+        query_tokens = self.tokenize(query)
+        if not query_tokens:
+            return []
+
+        scores = []
+        avgdl = self.avgdl if self.avgdl > 0 else 1.0
+
+        for i, doc_freq in enumerate(self.doc_freqs):
+            score = 0.0
+            doc_len = self.doc_lens[i]
+
+            for token in query_tokens:
+                if token not in self.idf:
+                    continue
+                tf = doc_freq.get(token, 0)
+                if tf == 0:
+                    continue
+
+                idf = self.idf[token]
+                numerator = tf * (self.k1 + 1)
+                denominator = tf + self.k1 * (1 - self.b + self.b * doc_len / avgdl)
+                score += idf * numerator / denominator
+
+            if score > 0:
+                scores.append((i, score))
+
+        scores.sort(key=lambda x: x[1], reverse=True)
+        return scores[:top_k]
+
+    def get_all_scores(self, query: str) -> np.ndarray:
+        """获取所有文档的BM25分数"""
+        scores = np.zeros(self.N)
+        query_tokens = self.tokenize(query)
+        if not query_tokens:
+            return scores
+
+        avgdl = self.avgdl if self.avgdl > 0 else 1.0
+
+        for i, doc_freq in enumerate(self.doc_freqs):
+            score = 0.0
+            doc_len = self.doc_lens[i]
+
+            for token in query_tokens:
+                if token not in self.idf:
+                    continue
+                tf = doc_freq.get(token, 0)
+                if tf == 0:
+                    continue
+
+                idf = self.idf[token]
+                numerator = tf * (self.k1 + 1)
+                denominator = tf + self.k1 * (1 - self.b + self.b * doc_len / avgdl)
+                score += idf * numerator / denominator
+
+            scores[i] = score
+
+        return scores
+
+# ============================================================
+# 文档加载器（增强版）
+# ============================================================
+class DocumentLoader:
+    SUPPORTED = {'.txt', '.md', '.markdown', '.json', '.py', '.html', '.csv', '.xml', '.log', '.rst'}
+    ENCODINGS = ['utf-8', 'utf-8-sig', 'gbk', 'gb2312', 'gb18030', 'latin-1']
+
+    def __init__(self, chunk_size: int = 512, chunk_overlap: int = 50, min_chunk_chars: int = 80):
+        self.chunk_size = chunk_size
+        self.chunk_overlap = min(chunk_overlap, chunk_size // 2)
+        self.min_chunk_chars = max(20, min_chunk_chars)
+        self.max_merge_size = int(chunk_size * 1.35)
+        self.md_chunker = MarkdownChunker(chunk_size, chunk_overlap, min_chunk_chars=min_chunk_chars)
+
+    def normalize_path(self, path_str: str) -> Path:
+        path_str = str(path_str).replace("\\", "/")
+        path = Path(path_str)
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        return path.resolve()
+
+    def read_file(self, path: Path) -> Optional[str]:
+        for enc in self.ENCODINGS:
+            try:
+                return path.read_text(encoding=enc)
+            except UnicodeDecodeError:
+                continue
+            except Exception:
+                return None
+        return None
+
+    def load_file(self, file_path: str) -> Optional[Document]:
+        path = self.normalize_path(file_path)
+
+        if not path.exists():
+            if DEBUG:
+                print(f"  [跳过] 不存在: {path}")
+            return None
+
+        if not path.is_file():
+            return None
+
+        content = self.read_file(path)
+        if content is None:
+            print(f"  [跳过] 读取失败: {path.name}")
+            return None
+
+        content = content.strip()
+        if not content:
+            print(f"  [跳过] 空文件: {path.name}")
+            return None
+
+        print(f"  [加载] {path.name} ({len(content)} 字符)")
+        return Document(
+            content=content,
+            metadata={
+                "source": str(path),
+                "filename": path.name,
+                "filetype": path.suffix.lower()
+            }
+        )
+
+    def load_directory(self, dir_path: str) -> List[Document]:
+        path = self.normalize_path(dir_path)
+        if not path.exists() or not path.is_dir():
+            print(f"  [跳过] 无效目录: {path}")
+            return []
+
+        docs = []
+        for f in sorted(path.rglob("*")):
+            if f.is_file() and f.suffix.lower() in self.SUPPORTED:
+                doc = self.load_file(str(f))
+                if doc:
+                    docs.append(doc)
+
+        return docs
+
+    def load(self, sources: List[str]) -> List[Document]:
+        docs = []
+        for src in sources:
+            path = self.normalize_path(src)
+            if path.is_file():
+                doc = self.load_file(str(path))
+                if doc:
+                    docs.append(doc)
+            elif path.is_dir():
+                docs.extend(self.load_directory(str(path)))
+        return docs
+
+    def split(self, documents: List[Document]) -> List[Chunk]:
+        """分割文档 - 使用Markdown感知分块 + 后处理"""
+        all_chunks = []
+
+        for doc in documents:
+            doc_id = doc.metadata.get("filename", "unknown")
+            filetype = doc.metadata.get("filetype", "")
+            text = doc.content
+
+            if not text or not text.strip():
+                print(f"  [跳过] 空内容: {doc_id}")
+                continue
+
+            print(f"  分块: {doc_id} ", end="", flush=True)
+
+            is_markdown_like = filetype in ['.md', '.markdown'] or self._looks_like_markdown(text)
+
+            if is_markdown_like:
+                chunk_tuples = self.md_chunker.split(text, doc.metadata)
+                chunks = []
+                for i, (content, header_ctx) in enumerate(chunk_tuples):
+                    chunks.append(Chunk(
+                        content=content,
+                        metadata=doc.metadata.copy(),
+                        doc_id=doc_id,
+                        chunk_id=i,
+                        header_context=header_ctx
+                    ))
+            else:
+                chunks = self._generic_split(text, doc_id, doc.metadata)
+
+            raw_count = len(chunks)
+            chunks = self._post_process_doc_chunks(chunks)
+
+            all_chunks.extend(chunks)
+
+            if raw_count != len(chunks):
+                print(f"-> {len(chunks)} 块 (清洗前 {raw_count} 块)")
+            else:
+                print(f"-> {len(chunks)} 块")
+
+        return all_chunks
+
+    def _generic_split(self, text: str, doc_id: str, metadata: Dict) -> List[Chunk]:
+        """通用分块方法"""
+        text = text.strip()
+        if not text:
+            return []
+
+        chunks = []
+        text_len = len(text)
+        pos = 0
+        chunk_id = 0
+
+        while pos < text_len:
+            end = min(pos + self.chunk_size, text_len)
+
+            if end < text_len:
+                search_start = pos + self.chunk_size // 2
+                best_pos = -1
+                best_sep_len = 1
+
+                for sep in ['。', '！', '？', '\n\n', '\n', '.', '!', '?', ';', '；']:
+                    idx = text.rfind(sep, search_start, end)
+                    if idx > best_pos:
+                        best_pos = idx
+                        best_sep_len = len(sep)
+
+                if best_pos > pos:
+                    end = best_pos + best_sep_len
+
+            chunk_text = text[pos:end].strip()
+            if chunk_text:
+                chunks.append(Chunk(
+                    content=chunk_text,
+                    metadata=metadata.copy(),
+                    doc_id=doc_id,
+                    chunk_id=chunk_id,
+                    header_context=""
+                ))
+                chunk_id += 1
+
+            if end >= text_len:
+                break
+
+            next_pos = end - self.chunk_overlap
+            if next_pos <= pos:
+                next_pos = pos + 1
+            pos = next_pos
+
+        return chunks
+
+	def _looks_like_markdown(self, text: str) -> bool:
+		if not text:
+			return False
+
+		return bool(
+			# 标题
+			re.search(r'^\s{0,3}#{1,6}\s+\S+', text, re.MULTILINE) or
+
+			# fenced code
+			re.search(r'^\s*([`~]{3,}).*$', text, re.MULTILINE) or
+
+			# 图片
+			re.search(r'!\[[^\]]*\]\([^)]+\)', text) or
+			re.search(r'!\[[^\]]*\]\[[^\]]+\]', text) or
+			re.search(r'^\s*\[[^\]]+\]:\s+\S+', text, re.MULTILINE) or
+			re.search(r'<img\b[^>]*>', text, re.IGNORECASE) or
+
+			# markdown 表格
+			re.search(
+				r'^\s*\|?.+\|.+\|?\s*$\n^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$',
+				text,
+				re.MULTILINE
+			) or
+
+			# 常见 markdown / 文档列表
+			re.search(
+				r'^\s*(?:[-*+]\s+(?:\[[ xX]\]\s+)?|\d+[.)]\s+|[（(]?\d+[）)]\s*|[一二三四五六七八九十]+[、.]\s*)\S+',
+				text,
+				re.MULTILINE
+			)
+		)
+
+    def _strip_header_prefix(self, content: str, header: str) -> str:
+        text = (content or "").strip()
+        h = (header or "").strip()
+        if h and text.startswith(h):
+            return text[len(h):].strip()
+        return text
+
+    def _chunk_body(self, chunk: Chunk) -> str:
+        return self._strip_header_prefix(chunk.content, chunk.header_context)
+
+	def _post_process_doc_chunks(self, chunks: List[Chunk]) -> List[Chunk]:
+		"""
+		文档级后处理：
+		1. 去掉真正空块/伪空白块
+		2. 合并短块（但不合并表格/列表/代码块）
+		3. 重排 chunk_id
+		"""
+		merged = []
+
+		for c in chunks:
+			body = self._chunk_body(c)
+			if not body:
+				continue
+
+			if self.md_chunker._is_semantic_empty_text(body):
+				continue
+
+			if merged:
+				prev = merged[-1]
+				prev_body = self._chunk_body(prev)
+
+				same_doc = prev.doc_id == c.doc_id
+				same_header = prev.header_context == c.header_context
+				short_prev = len(prev_body) < self.min_chunk_chars
+				short_curr = len(body) < self.min_chunk_chars
+
+				structured_prev = self.md_chunker._is_structured_block(prev_body)
+				structured_curr = self.md_chunker._is_structured_block(body)
+
+				merged_body = (prev_body.rstrip() + "\n\n" + body.lstrip()).strip()
+				merged_text = f"{prev.header_context}\n\n{merged_body}".strip() if prev.header_context else merged_body
+
+				if (
+					same_doc and
+					same_header and
+					not structured_prev and
+					not structured_curr and
+					(short_prev or short_curr) and
+					len(merged_text) <= self.max_merge_size
+				):
+					merged[-1] = Chunk(
+						content=merged_text,
+						metadata=prev.metadata.copy(),
+						doc_id=prev.doc_id,
+						chunk_id=prev.chunk_id,
+						header_context=prev.header_context
+					)
+					continue
+
+			rebuilt = Chunk(
+				content=(f"{c.header_context}\n\n{body}".strip() if c.header_context else body),
+				metadata=c.metadata.copy(),
+				doc_id=c.doc_id,
+				chunk_id=c.chunk_id,
+				header_context=c.header_context
+			)
+			merged.append(rebuilt)
+
+		for i, c in enumerate(merged):
+			c.chunk_id = i
+
+		return merged
+
+# ============================================================
+# Embedding 客户端
+# ============================================================
+class EmbeddingClient:
+    def __init__(self):
+        self.model_path = LOCAL_EMBEDDING_PATH
+        self.device = EMBEDDING_DEVICE
+        self.max_length = EMBEDDING_MAX_LENGTH
+        self.dimension = EMBEDDING_DIM
+
+        if self.device == "cuda" and not torch.cuda.is_available():
+            print("CUDA 不可用，自动切换到 CPU")
+            self.device = "cpu"
+
+        if not self.model_path:
+            raise ValueError("LOCAL_EMBEDDING_PATH 未配置")
+
+        model_dir = Path(self.model_path)
+        if not model_dir.exists():
+            raise FileNotFoundError(f"本地 embedding 模型不存在: {model_dir}")
+
+        print(f"加载本地 Embedding 模型: {model_dir}")
+        print(f"Embedding Device: {self.device}")
+
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            str(model_dir),
+            local_files_only=True
+        )
+        self.model = AutoModel.from_pretrained(
+            str(model_dir),
+            local_files_only=True
+        )
+        self.model.to(self.device)
+        self.model.eval()
+
+        self.dimension = getattr(self.model.config, "hidden_size", EMBEDDING_DIM)
+
+    def embed(self, texts: List[str]) -> Optional[np.ndarray]:
+        if not texts:
+            return None
+
+        try:
+            texts = [t if isinstance(t, str) else str(t) for t in texts]
+
+            encoded = self.tokenizer(
+                texts,
+                padding=True,
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors="pt"
+            )
+            encoded = {k: v.to(self.device) for k, v in encoded.items()}
+
+            with torch.no_grad():
+                outputs = self.model(**encoded)
+                # bge-m3 的 dense embedding 可直接取 CLS 向量
+                embeddings = outputs.last_hidden_state[:, 0]
+
+            return embeddings.cpu().numpy().astype(np.float32)
+
+        except Exception as e:
+            print(f"Embedding 错误: {e}")
+            return None
+
+# ============================================================
+# LLM 客户端
+# ============================================================
+class LLMClient:
+    def __init__(self):
+        self.url = LLM_URL
+        self.headers = {"Content-Type": "application/json"}
+        if LLM_KEY:
+            self.headers["Authorization"] = LLM_KEY
+
+    def chat(self, messages: List[Dict], max_tokens: int = 2048, temperature: float = 0.7) -> str:
+        if not self.url:
+            return "LLM 错误: LLM_URL 未配置"
+
+        payload = {
+            "model": LLM_MODEL,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature
+        }
+
+        try:
+            resp = requests.post(self.url, headers=self.headers, json=payload, timeout=120)
+            resp.raise_for_status()
+            data = resp.json()
+
+            if "choices" in data:
+                return data["choices"][0]["message"]["content"]
+            elif "response" in data:
+                return data["response"]
+            else:
+                return f"未知响应格式: {list(data.keys())}"
+        except Exception as e:
+            return f"LLM 错误: {e}"
+
+# ============================================================
+# 混合检索向量存储
+# ============================================================
+class HybridVectorStore:
+    """混合检索向量存储：BM25 + 向量相似度"""
+
+    def __init__(self, embedding_client: EmbeddingClient,
+                 vector_weight: float = 0.6,
+                 bm25_weight: float = 0.4):
+        self.client = embedding_client
+        self.chunks: List[Chunk] = []
+        self.vectors: Optional[np.ndarray] = None
+        self.bm25 = BM25Retriever()
+        self.vector_weight = vector_weight
+        self.bm25_weight = bm25_weight
+
+    def add(self, chunks: List[Chunk]):
+        """添加文档块到索引"""
+        if not chunks:
+            print("没有文档块可添加")
+            return
+
+        texts = [c.content for c in chunks]
+        print(f"\n生成向量 ({len(texts)} 个文本)...")
+
+        batch_size = EMBEDDING_BATCH_SIZE
+        all_vectors = []
+        valid_chunks = []
+
+        for i in range(0, len(texts), batch_size):
+            batch_chunks = chunks[i:i + batch_size]
+            batch = [c.content for c in batch_chunks]
+            vectors = self.client.embed(batch)
+
+            if vectors is None or len(vectors) != len(batch_chunks):
+                print(f"  批次 {i // batch_size + 1} 失败")
+                continue
+
+            all_vectors.append(vectors)
+            valid_chunks.extend(batch_chunks)
+            print(f"  已处理 {min(i + batch_size, len(texts))}/{len(texts)}")
+
+        if not all_vectors:
+            print("向量生成失败！")
+            return
+
+        vectors = np.vstack(all_vectors)
+
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        norms = np.where(norms == 0, 1, norms)
+        vectors = vectors / norms
+
+        self.chunks.extend(valid_chunks)
+
+        if self.vectors is None:
+            self.vectors = vectors
+        else:
+            self.vectors = np.vstack([self.vectors, vectors])
+
+        print("构建BM25索引...")
+        all_texts = [c.content for c in self.chunks]
+        self.bm25.fit(all_texts)
+
+        print(f"向量库大小: {len(self.chunks)} 个文档块")
+        if DEBUG:
+            print(f"向量维度: {self.vectors.shape}")
+
+    def search(self, query: str, top_k: int = 5, verbose: bool = True) -> List[SearchResult]:
+        """
+        混合检索
+        Args:
+            query: 原始查询
+            top_k: 返回结果数量
+        """
+        if self.vectors is None or len(self.chunks) == 0:
+            if verbose:
+                print("[搜索] 向量库为空！")
+            return []
+
+        vector_scores = np.zeros(len(self.chunks))
+        q_vec = self.client.embed([query])
+
+        if q_vec is not None and len(q_vec) > 0:
+            q_vec = q_vec[0]
+            q_norm = np.linalg.norm(q_vec)
+            if q_norm > 0:
+                q_vec = q_vec / q_norm
+                vector_scores = np.dot(self.vectors, q_vec)
+
+        bm25_scores = self.bm25.get_all_scores(query)
+
+        if vector_scores.max() > vector_scores.min():
+            vector_scores_norm = (vector_scores - vector_scores.min()) / (vector_scores.max() - vector_scores.min())
+        else:
+            vector_scores_norm = vector_scores
+
+        if bm25_scores.max() > bm25_scores.min():
+            bm25_scores_norm = (bm25_scores - bm25_scores.min()) / (bm25_scores.max() - bm25_scores.min())
+        else:
+            bm25_scores_norm = bm25_scores
+
+        combined_scores = (
+            self.vector_weight * vector_scores_norm +
+            self.bm25_weight * bm25_scores_norm
+        )
+
+        if DEBUG and verbose:
+            print(f"[搜索] 向量分数范围: {vector_scores.min():.4f} - {vector_scores.max():.4f}")
+            print(f"[搜索] BM25分数范围: {bm25_scores.min():.4f} - {bm25_scores.max():.4f}")
+            print(f"[搜索] 融合分数范围: {combined_scores.min():.4f} - {combined_scores.max():.4f}")
+
+        top_indices = np.argsort(combined_scores)[::-1][:top_k]
+        results = []
+
+        for idx in top_indices:
+            results.append(SearchResult(
+                chunk=self.chunks[idx],
+                score=float(combined_scores[idx]),
+                vector_score=float(vector_scores[idx]),
+                bm25_score=float(bm25_scores[idx])
+            ))
+
+        if DEBUG and verbose:
+            print(f"[搜索] 返回 {len(results)} 个结果:")
+            for i, r in enumerate(results, 1):
+                print(f"  {i}. [综合:{r.score:.3f} V:{r.vector_score:.3f} B:{r.bm25_score:.3f}] {r.chunk.doc_id}")
+
+        return results
+
+    def clear(self):
+        self.chunks = []
+        self.vectors = None
+        self.bm25 = BM25Retriever()
+
+    def save(self, save_dir: str):
+        if self.vectors is None or not self.chunks:
+            raise RuntimeError("当前索引为空，无法保存。")
+
+        save_path = Path(save_dir).resolve()
+        save_path.mkdir(parents=True, exist_ok=True)
+
+        vectors_path = save_path / "vectors.npy"
+        chunks_path = save_path / "chunks.jsonl"
+        meta_path = save_path / "meta.json"
+
+        np.save(vectors_path, self.vectors.astype(np.float32), allow_pickle=False)
+
+        with open(chunks_path, "w", encoding="utf-8") as f:
+            for c in self.chunks:
+                row = {
+                    "content": c.content,
+                    "metadata": c.metadata,
+                    "doc_id": c.doc_id,
+                    "chunk_id": c.chunk_id,
+                    "header_context": c.header_context
+                }
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+        meta = {
+            "embedding_model": EMBEDDING_MODEL,
+            "embedding_dim": int(self.vectors.shape[1]),
+            "chunk_count": len(self.chunks),
+            "vector_weight": self.vector_weight,
+            "bm25_weight": self.bm25_weight,
+            "chunk_size": CHUNK_SIZE,
+            "chunk_overlap": CHUNK_OVERLAP
+        }
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+
+        print(f"\n索引已保存到: {save_path}")
+
+    def load(self, save_dir: str):
+        save_path = Path(save_dir).resolve()
+        vectors_path = save_path / "vectors.npy"
+        chunks_path = save_path / "chunks.jsonl"
+        meta_path = save_path / "meta.json"
+
+        if not save_path.exists():
+            raise FileNotFoundError(f"索引目录不存在: {save_path}")
+        if not vectors_path.exists():
+            raise FileNotFoundError(f"缺少文件: {vectors_path}")
+        if not chunks_path.exists():
+            raise FileNotFoundError(f"缺少文件: {chunks_path}")
+
+        self.clear()
+
+        self.vectors = np.load(vectors_path, allow_pickle=False).astype(np.float32)
+
+        chunks = []
+        with open(chunks_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                chunks.append(Chunk(
+                    content=obj["content"],
+                    metadata=obj["metadata"],
+                    doc_id=obj["doc_id"],
+                    chunk_id=obj["chunk_id"],
+                    header_context=obj.get("header_context", "")
+                ))
+
+        if len(chunks) != len(self.vectors):
+            raise RuntimeError("索引损坏：chunks 数量与 vectors 数量不一致")
+
+        self.chunks = chunks
+
+        if meta_path.exists():
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            self.vector_weight = float(meta.get("vector_weight", self.vector_weight))
+            self.bm25_weight = float(meta.get("bm25_weight", self.bm25_weight))
+
+        print("重建BM25索引...")
+        all_texts = [c.content for c in self.chunks]
+        self.bm25.fit(all_texts)
+
+        print(f"\n索引加载完成: {save_path}")
+        print(f"向量库大小: {len(self.chunks)} 个文档块")
+        if DEBUG:
+            print(f"向量维度: {self.vectors.shape}")
+
+    def __len__(self):
+        return len(self.chunks)
+
+# ============================================================
+# RAG 引擎（删除查询重写版）
+# ============================================================
+class RAG:
+    def __init__(self):
+        print("\n" + "=" * 60)
+        print("初始化 RAG 系统（增强版）")
+        print("=" * 60)
+
+        # self.loader = DocumentLoader(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+        self.loader = DocumentLoader(
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP,
+            min_chunk_chars=MIN_CHUNK_CHARS
+        )
+        self.embedding = EmbeddingClient()
+        self.llm = LLMClient()
+        self.store = HybridVectorStore(
+            self.embedding,
+            vector_weight=VECTOR_WEIGHT,
+            bm25_weight=BM25_WEIGHT
+        )
+
+        print("配置:")
+        #print(f"  Embedding: {EMBEDDING_URL}")
+        print(f"  Embedding(local): {LOCAL_EMBEDDING_PATH}")
+        print(f"  Embedding Device: {EMBEDDING_DEVICE}")
+        print(f"  LLM: {LLM_URL}")
+        print(f"  Chunk Size: {CHUNK_SIZE}")
+        print(f"  Min Chunk Chars: {MIN_CHUNK_CHARS}")
+        print(f"  Top K: {TOP_K}")
+        print(f"  混合检索: 向量权重={VECTOR_WEIGHT}, BM25权重={BM25_WEIGHT}")
+        print(f"  Debug: {DEBUG}")
+        print("初始化完成!\n")
+
+    def load_knowledge(self, sources: List[str]) -> int:
+        """加载知识库"""
+        if not sources:
+            print("没有指定知识源")
+            return 0
+
+        print("=" * 40)
+        print("加载文档...")
+        print("=" * 40)
+
+        docs = self.loader.load(sources)
+        if not docs:
+            print("没有找到有效文档！")
+            return 0
+
+        print(f"\n成功加载 {len(docs)} 个文档")
+
+        type_counts = Counter(d.metadata.get('filetype', 'unknown') for d in docs)
+        print("文件类型分布:")
+        for ft, count in type_counts.items():
+            print(f"  {ft}: {count}")
+
+        print("\n分割文档（使用Markdown感知分块）...")
+        chunks = self.loader.split(docs)
+        if not chunks:
+            print("分块失败！")
+            return 0
+
+        print(f"生成 {len(chunks)} 个文档块")
+        self.store.add(chunks)
+        return len(chunks)
+
+    def save_index(self, save_dir: str):
+        self.store.save(save_dir)
+
+    def load_index(self, save_dir: str):
+        self.store.load(save_dir)
+
+    def retrieve(self, question: str, top_k: int = None, verbose: bool = True) -> List[SearchResult]:
+        top_k = top_k or TOP_K
+        return self.store.search(question, top_k=top_k, verbose=verbose)
+
+    def query(self, question: str, top_k: int = None, verbose: bool = True) -> Tuple[str, List[SearchResult]]:
+        """
+        问答
+        Args:
+            question: 用户问题
+            top_k: 返回结果数量
+        """
+        if verbose:
+            print("\n" + "-" * 40)
+            print(f"问题: {question}")
+            print("-" * 40)
+
+        if len(self.store) == 0:
+            return "知识库为空，请先加载文档。", []
+
+        top_k = top_k or TOP_K
+
+        if verbose:
+            print("\n[步骤1] 混合检索...")
+
+        results = self.store.search(question, top_k=top_k, verbose=verbose)
+        if not results:
+            return "检索失败，没有找到相关内容。", []
+
+        if verbose:
+            print(f"\n检索到 {len(results)} 个相关片段:")
+            for i, r in enumerate(results, 1):
+                print(f"\n  [{i}] 综合分数: {r.score:.4f} (向量: {r.vector_score:.4f}, BM25: {r.bm25_score:.4f})")
+                print(f"      来源: {r.chunk.metadata.get('filename', '未知')}")
+                if r.chunk.header_context:
+                    print(f"      章节: {r.chunk.header_context.split(chr(10))[0][:50]}...")
+                print(f"      内容: {r.chunk.content[:100]}...")
+
+        context_parts = []
+        for i, r in enumerate(results, 1):
+            source = r.chunk.metadata.get("filename", "未知")
+            header = r.chunk.header_context
+            context_entry = f"[文档{i}] (来源: {source}, 相关度: {r.score:.2f})"
+            if header:
+                context_entry += f"\n章节: {header}"
+            context_entry += f"\n内容:\n{r.chunk.content}"
+            context_parts.append(context_entry)
+
+        context = "\n\n" + "=" * 50 + "\n\n".join(context_parts)
+
+        if DEBUG and verbose:
+            print(f"\n[调试] 上下文长度: {len(context)} 字符")
+
+        if verbose:
+            print("\n[步骤2] 调用 LLM 生成回答...")
+
+        messages = [
+            {
+                "role": "system",
+                "content": """你是一个专业的AI助手。请根据提供的上下文信息回答用户问题。
+规则：
+1. 仔细阅读所有提供的上下文信息
+2. 基于上下文内容回答问题，优先引用相关度高的文档
+3. 如果多个文档包含相关信息，请综合总结
+4. 如果上下文中有明确的章节信息，可以在回答中引用
+5. 如果确实没有相关信息，请说明"根据提供的文档，没有找到相关信息"
+6. 不要编造上下文中没有的内容"""
+            },
+            {
+                "role": "user",
+                "content": f"""请根据以下上下文回答问题。
+上下文信息：
+{context}
+问题：{question}
+请回答："""
+            }
+        ]
+
+        answer = self.llm.chat(messages)
+        return answer, results
+
+    def interactive(self):
+        """交互模式"""
+        print("\n" + "=" * 60)
+        print("交互问答模式（增强版）")
+        print("=" * 60)
+        print("命令:")
+        print("  直接输入问题进行问答")
+        print("  /add <路径>        - 添加文件或目录")
+        print("  /list              - 列出已加载的文档")
+        print("  /search <词>       - 仅搜索不回答")
+        print("  /save_index <目录> - 保存当前索引")
+        print("  /load_index <目录> - 加载已有索引")
+        print("  /weights <v> <b>   - 调整检索权重")
+        print("  /debug             - 切换调试模式")
+        print("  /stats             - 显示统计信息")
+        print("  /quit              - 退出")
+        print("=" * 60 + "\n")
+
+        global DEBUG
+
+        while True:
+            try:
+                user_input = input("\n🧑 问题: ").strip()
+                if not user_input:
+                    continue
+
+                if user_input.startswith("/"):
+                    parts = user_input.split(maxsplit=1)
+                    cmd = parts[0].lower()
+                    arg = parts[1] if len(parts) > 1 else ""
+
+                    if cmd in ["/quit", "/exit", "/q"]:
+                        print("再见！")
+                        break
+
+                    elif cmd == "/add":
+                        if arg:
+                            self.load_knowledge([arg])
+                        else:
+                            print("用法: /add <文件或目录路径>")
+
+                    elif cmd == "/list":
+                        print(f"\n已加载 {len(self.store)} 个文档块:")
+                        doc_names = set(c.doc_id for c in self.store.chunks)
+                        for name in sorted(doc_names):
+                            count = sum(1 for c in self.store.chunks if c.doc_id == name)
+                            print(f"  - {name} ({count} 块)")
+
+                    elif cmd == "/search":
+                        if arg:
+                            results = self.store.search(arg, TOP_K, verbose=True)
+                            print(f"\n搜索 '{arg}' 的结果:")
+                            for i, r in enumerate(results, 1):
+                                print(f"\n{i}. [综合:{r.score:.3f} V:{r.vector_score:.3f} B:{r.bm25_score:.3f}]")
+                                print(f"   来源: {r.chunk.doc_id}")
+                                print(f"   内容: {r.chunk.content[:150]}...")
+                        else:
+                            print("用法: /search <关键词>")
+
+                    elif cmd == "/save_index":
+                        if arg:
+                            self.save_index(arg)
+                        else:
+                            print("用法: /save_index <目录>")
+
+                    elif cmd == "/load_index":
+                        if arg:
+                            self.load_index(arg)
+                        else:
+                            print("用法: /load_index <目录>")
+
+                    elif cmd == "/weights":
+                        try:
+                            sub_parts = arg.split()
+                            if len(sub_parts) == 2:
+                                v_weight = float(sub_parts[0])
+                                b_weight = float(sub_parts[1])
+                                self.store.vector_weight = v_weight
+                                self.store.bm25_weight = b_weight
+                                print(f"检索权重已更新: 向量={v_weight}, BM25={b_weight}")
+                            else:
+                                print(f"当前权重: 向量={self.store.vector_weight}, BM25={self.store.bm25_weight}")
+                                print("用法: /weights <向量权重> <BM25权重>")
+                        except ValueError:
+                            print("请输入有效的数字")
+
+                    elif cmd == "/debug":
+                        DEBUG = not DEBUG
+                        print(f"调试模式: {'开启' if DEBUG else '关闭'}")
+
+                    elif cmd == "/stats":
+                        print(f"\n统计信息:")
+                        print(f"  文档块数量: {len(self.store)}")
+                        print(f"  向量维度: {self.embedding.dimension}")
+                        print(f"  BM25词汇量: {len(self.store.bm25.idf)}")
+                        print(f"  检索权重: 向量={self.store.vector_weight}, BM25={self.store.bm25_weight}")
+                        if self.store.vectors is not None:
+                            print(f"  向量矩阵: {self.store.vectors.shape}")
+
+                    else:
+                        print(f"未知命令: {cmd}")
+
+                    continue
+
+                answer, sources = self.query(user_input, verbose=True)
+                print(f"\n🤖 回答:\n{answer}")
+
+                if sources:
+                    print(f"\n📚 参考来源 (共 {len(sources)} 个):")
+                    for r in sources[:5]:
+                        print(f"  - [{r.score:.2f}] {r.chunk.metadata.get('filename', '未知')}")
+                        if r.chunk.header_context:
+                            header_line = r.chunk.header_context.split('\n')[0]
+                            print(f"    章节: {header_line[:50]}...")
+
+            except KeyboardInterrupt:
+                print("\n\n再见！")
+                break
+            except Exception as e:
+                print(f"\n❌ 错误: {e}")
+                if DEBUG:
+                    import traceback
+                    traceback.print_exc()
+
+# ============================================================
+# 测试集生成器
+# ============================================================
+class TestsetGenerator:
+    SEMICON_GLOSSARY = {
+        "晶圆": ["wafer", "晶圆", "片子"],
+        "晶圆厂": ["fab", "fab厂", "晶圆厂"],
+        "裸片": ["die", "裸片", "die片"],
+        "良率": ["yield", "良率", "yld"],
+        "机台": ["tool", "机台", "设备"],
+        "流片": ["tape-out", "tapeout", "流片"],
+        "光罩": ["mask", "reticle", "光罩", "掩模版"],
+        "刻蚀": ["etch", "刻蚀", "蚀刻"],
+        "沉积": ["deposition", "沉积", "薄膜沉积"],
+        "光刻": ["lithography", "光刻", "曝光"],
+        "套刻": ["overlay", "套刻"],
+        "关键尺寸": ["cd", "critical dimension", "关键尺寸", "线宽"],
+        "在制品": ["wip", "在制品"],
+        "化学机械抛光": ["cmp", "化学机械抛光", "抛光"],
+        "前段工艺": ["feol", "前段工艺"],
+        "后段工艺": ["beol", "后段工艺"],
+        "缺陷密度": ["defect density", "缺陷密度", "d0"],
+        "重布线层": ["rdl", "重布线层"],
+        "凸块": ["bump", "凸块"],
+        "封装": ["packaging", "封装", "pkg"]
+    }
+
+    def __init__(self, llm_client: LLMClient, store: HybridVectorStore):
+        self.llm = llm_client
+        self.store = store
+        self.refusal_answer = DEFAULT_REFUSAL_ANSWER
+        self.tokenizer = BM25Retriever()
+
+        self.doc_chunks = defaultdict(list)
+        for c in self.store.chunks:
+            doc_key = c.metadata.get("source", c.doc_id)
+            self.doc_chunks[doc_key].append(c)
+
+        self.semicon_terms = set()
+        for aliases in self.SEMICON_GLOSSARY.values():
+            for t in aliases:
+                self.semicon_terms.add(t.lower())
+
+    @staticmethod
+    def _extract_json(text: str):
+        text = text.strip()
+        text = re.sub(r"^```json\s*", "", text, flags=re.I)
+        text = re.sub(r"^```\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+
+        candidates = []
+        s1, e1 = text.find("{"), text.rfind("}")
+        s2, e2 = text.find("["), text.rfind("]")
+
+        if s1 != -1 and e1 != -1 and e1 > s1:
+            candidates.append(text[s1:e1 + 1])
+        if s2 != -1 and e2 != -1 and e2 > s2:
+            candidates.append(text[s2:e2 + 1])
+
+        for c in sorted(candidates, key=len, reverse=True):
+            try:
+                return json.loads(c)
+            except Exception:
+                continue
+
+        raise ValueError(f"LLM 输出不是有效 JSON，原始输出前200字符: {text[:200]}")
+
+    @staticmethod
+    def _make_case_id(prefix: str, question: str, keys: List[str]) -> str:
+        raw = f"{prefix}::{question}::" + "||".join(sorted(keys))
+        return hashlib.md5(raw.encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _is_good_chunk(chunk: Chunk, min_chars: int = 120) -> bool:
+        text = chunk.content.strip()
+        if len(text) < min_chars:
+            return False
+        plain = re.sub(r'```[\s\S]*?```', '', text).strip()
+        if len(plain) < 40:
+            return False
+        return True
+
+    @staticmethod
+    def _is_disamb_candidate(chunk: Chunk) -> bool:
+        text = chunk.content.lower()
+        keywords = [
+            "区别", "不同", "差异", "对比", "相比", "分别", "选择", "优先", "而不是",
+            "vs", "versus", "difference", "compare", "between", "option"
+        ]
+        if any(k in text for k in keywords):
+            return True
+        if len(re.findall(r"\n\s*[-*+]\s+", chunk.content)) >= 2:
+            return True
+        if "|" in chunk.content and "\n|" in chunk.content:
+            return True
+        return False
+
+    @staticmethod
+    def _is_reasoning_candidate(chunk: Chunk) -> bool:
+        text = chunk.content.lower()
+        keywords = [
+            "如果", "当", "则", "条件", "阈值", "超过", "低于", "不少于", "不超过",
+            "先", "后", "然后", "before", "after", "if", "when", "threshold",
+            "greater than", "less than", "must", "should"
+        ]
+        return any(k in text for k in keywords) or bool(re.search(r"\d", text))
+
+    def _is_semiconductor_candidate(self, chunk: Chunk) -> bool:
+        text = chunk.content.lower()
+        return any(term in text for term in self.semicon_terms)
+
+    def _ctx_from_chunk(self, chunk: Chunk) -> Dict:
+        return {
+            "source_doc": chunk.metadata.get("filename", chunk.doc_id),
+            "source_path": chunk.metadata.get("source", ""),
+            "chunk_id": chunk.chunk_id,
+            "header": chunk.header_context,
+            "text": chunk.content
+        }
+
+    def _format_contexts(self, contexts: List[Dict]) -> str:
+        parts = []
+        for i, ctx in enumerate(contexts, 1):
+            part = f"[SOURCE {i}] 文档: {ctx['source_doc']}\n"
+            if ctx.get("header"):
+                part += f"章节:\n{ctx['header']}\n"
+            part += f"内容:\n{ctx['text']}"
+            parts.append(part)
+        return "\n\n-----\n\n".join(parts)
+
+    def _validate_evidence_list(self, evidence_list: List[Dict], contexts: List[Dict], answer: str) -> Optional[List[int]]:
+        used_indices = []
+
+        for item in evidence_list:
+            try:
+                src_idx = int(item.get("source_index", 1)) - 1
+            except Exception:
+                return None
+
+            if src_idx < 0 or src_idx >= len(contexts):
+                return None
+
+            ev = str(item.get("evidence", "")).strip()
+            if not ev:
+                return None
+
+            src_text_norm = normalize_text(contexts[src_idx]["text"])
+            ev_norm = normalize_text(ev)
+            ans_norm = normalize_text(answer)
+
+            if ev_norm not in src_text_norm:
+                if ans_norm and ans_norm in src_text_norm:
+                    pass
+                else:
+                    return None
+
+            used_indices.append(src_idx)
+
+        return used_indices
+
+    def _question_has_lexical_gap(self, question: str, source_texts: List[str]) -> bool:
+        q_norm = normalize_text(question)
+        source_norm = normalize_text("\n".join(source_texts))
+        if q_norm and q_norm in source_norm:
+            return False
+
+        q_tokens = set(self.tokenizer.tokenize(question))
+        s_tokens = set()
+        for t in source_texts:
+            s_tokens |= set(self.tokenizer.tokenize(t[:3000]))
+
+        if not q_tokens:
+            return True
+
+        overlap_ratio = len(q_tokens & s_tokens) / max(1, len(q_tokens))
+        return overlap_ratio < 0.85
+
+    def _has_out_of_source_alias(self, alias_terms: List[str], source_texts: List[str]) -> bool:
+        src = normalize_text("\n".join(source_texts))
+        for term in alias_terms:
+            term_n = normalize_text(term)
+            if term_n and term_n not in src:
+                return True
+        return False
+
+    def _judge_advanced_case(self,
+                             question: str,
+                             answer: str,
+                             contexts: List[Dict],
+                             require_multi_source: bool = False,
+                             require_reasoning: bool = False,
+                             require_paraphrase: bool = False) -> bool:
+        context_text = self._format_contexts(contexts)
+
+        prompt = f"""
+你是 RAG 测试样本审查员，请判断下面的样本是否合格。
+要求：
+1. answer 必须能够完全根据上下文推出，不能依赖外部知识
+2. 如果 require_multi_source=true，则问题必须至少需要综合两个来源，不能单靠其中一个来源完整回答
+3. 如果 require_reasoning=true，则问题应需要一定推理/归纳/比较/条件判断，而不是直接摘抄一句话
+4. 如果 require_paraphrase=true，则问题表述应与原文存在明显语义改写，不是简单照抄
+5. 只输出 JSON
+
+输出格式：
+{{
+  "valid": true/false,
+  "uses_multiple_sources": true/false,
+  "requires_reasoning": true/false,
+  "is_paraphrased": true/false
+}}
+
+require_multi_source={str(require_multi_source).lower()}
+require_reasoning={str(require_reasoning).lower()}
+require_paraphrase={str(require_paraphrase).lower()}
+
+问题：
+{question}
+
+答案：
+{answer}
+
+上下文：
+{context_text}
+        """.strip()
+
+        raw = self.llm.chat(
+            [{"role": "system", "content": "你是严格的 RAG 样本审查员，只输出 JSON。"},
+             {"role": "user", "content": prompt}],
+            max_tokens=400,
+            temperature=0.1
+        )
+
+        if raw.startswith("LLM 错误:"):
+            return False
+
+        try:
+            obj = self._extract_json(raw)
+            if isinstance(obj, list):
+                obj = obj[0] if obj else {}
+            if not isinstance(obj, dict):
+                return False
+
+            if not bool(obj.get("valid", False)):
+                return False
+            if require_multi_source and not bool(obj.get("uses_multiple_sources", False)):
+                return False
+            if require_reasoning and not bool(obj.get("requires_reasoning", False)):
+                return False
+            if require_paraphrase and not bool(obj.get("is_paraphrased", False)):
+                return False
+
+            return True
+        except Exception:
+            return False
+
+    def _build_answer_case(self,
+                           obj: Dict,
+                           contexts: List[Dict],
+                           case_type: str,
+                           tags: Optional[List[str]] = None,
+                           require_multi_source: bool = False,
+                           require_reasoning: bool = False,
+                           require_paraphrase: bool = False,
+                           require_alias: bool = False) -> Optional[TestCase]:
+        if not isinstance(obj, dict) or obj.get("skip"):
+            return None
+
+        question = str(obj.get("question", "")).strip()
+        answer = str(obj.get("answer", "")).strip()
+        difficulty = str(obj.get("difficulty", "medium")).strip() or "medium"
+
+        if not question or not answer or len(question) < 6:
+            return None
+
+        evidence_list = obj.get("evidence_list", [])
+        if not evidence_list:
+            ev = str(obj.get("evidence", "")).strip()
+            if ev:
+                evidence_list = [{"source_index": 1, "evidence": ev}]
+            else:
+                return None
+
+        if not isinstance(evidence_list, list) or not evidence_list:
+            return None
+
+        used_indices = self._validate_evidence_list(evidence_list, contexts, answer)
+        if used_indices is None:
+            return None
+
+        unique_indices = []
+        seen = set()
+        for idx in used_indices:
+            key = (contexts[idx]["source_path"], contexts[idx]["chunk_id"])
+            if key not in seen:
+                seen.add(key)
+                unique_indices.append(idx)
+
+        if require_multi_source and len(unique_indices) < 2:
+            return None
+
+        source_texts = [ctx["text"] for ctx in contexts]
+        if require_paraphrase and not self._question_has_lexical_gap(question, source_texts):
+            return None
+
+        if require_alias:
+            alias_terms = obj.get("used_alias_terms", [])
+            if not isinstance(alias_terms, list) or not alias_terms:
+                return None
+            alias_terms = [str(x).strip() for x in alias_terms if str(x).strip()]
+            if not alias_terms:
+                return None
+            if not self._has_out_of_source_alias(alias_terms, source_texts):
+                return None
+
+        if case_type in {
+            "doc_synthesis", "cross_doc_synthesis", "semantic_paraphrase",
+            "reasoning", "multi_hop", "semiconductor_alias"
+        }:
+            if not self._judge_advanced_case(
+                question=question,
+                answer=answer,
+                contexts=contexts,
+                require_multi_source=require_multi_source,
+                require_reasoning=require_reasoning,
+                require_paraphrase=require_paraphrase
+            ):
+                return None
+
+        gold_sources = []
+        for n, idx in enumerate(unique_indices):
+            ctx = contexts[idx]
+            gold_sources.append({
+                "source_doc": ctx["source_doc"],
+                "source_path": ctx["source_path"],
+                "chunk_id": int(ctx["chunk_id"]),
+                "header": ctx.get("header", ""),
+                "role": "primary" if n == 0 else "support"
+            })
+
+        if not gold_sources:
+            return None
+
+        primary = gold_sources[0]
+        evidence_text = "\n".join(
+            [f"[source{item.get('source_index', 1)}] {str(item.get('evidence', '')).strip()}" for item in evidence_list]
+        )
+
+        key_list = [f"{g['source_path']}#{g['chunk_id']}" for g in gold_sources]
+        case_id = self._make_case_id(case_type, question, key_list)
+
+        return TestCase(
+            case_id=case_id,
+            question=question,
+            expected_behavior="answer",
+            expected_answer=answer,
+            evidence=evidence_text,
+            case_type=case_type,
+            difficulty=difficulty,
+
+            source_doc=primary["source_doc"],
+            source_path=primary["source_path"],
+            source_chunk_id=primary["chunk_id"],
+            source_header=primary.get("header", ""),
+
+            origin_doc=primary["source_doc"],
+            origin_path=primary["source_path"],
+            origin_chunk_id=primary["chunk_id"],
+            origin_header=primary.get("header", ""),
+
+            gold_sources=gold_sources,
+            tags=tags or []
+        )
+
+    def _pick_doc_chunks(self, doc_chunks: List[Chunk], k: int = 3) -> List[Chunk]:
+        if len(doc_chunks) <= k:
+            return doc_chunks[:]
+
+        by_header = defaultdict(list)
+        for c in doc_chunks:
+            by_header[first_header_line(c.header_context, 80)].append(c)
+
+        chosen = []
+        for _, items in by_header.items():
+            chosen.append(random.choice(items))
+            if len(chosen) >= k:
+                break
+
+        remaining = [c for c in doc_chunks if c not in chosen]
+        random.shuffle(remaining)
+        for c in remaining:
+            if len(chosen) >= k:
+                break
+            chosen.append(c)
+
+        return chosen[:k]
+
+    def _doc_term_set(self, doc_chunks: List[Chunk]) -> set:
+        text = "\n".join(c.content[:500] for c in doc_chunks[:8])
+        tokens = self.tokenizer.tokenize(text)
+        freq = Counter(tokens)
+        return {t for t, _ in freq.most_common(50)}
+
+    def _rank_doc_pairs(self, doc_paths: List[str]) -> List[Tuple[str, str, int]]:
+        doc_terms = {p: self._doc_term_set(self.doc_chunks[p]) for p in doc_paths}
+        pairs = []
+        for i in range(len(doc_paths)):
+            for j in range(i + 1, len(doc_paths)):
+                a = doc_paths[i]
+                b = doc_paths[j]
+                overlap = len(doc_terms[a] & doc_terms[b])
+                pairs.append((a, b, overlap))
+
+        pairs.sort(key=lambda x: x[2], reverse=True)
+        return pairs
+
+    def _pick_best_cross_doc_pair(self, doc_a: str, doc_b: str) -> Optional[List[Dict]]:
+        chunks_a = self.doc_chunks.get(doc_a, [])
+        chunks_b = self.doc_chunks.get(doc_b, [])
+        if not chunks_a or not chunks_b:
+            return None
+
+        sample_a = self._pick_doc_chunks(chunks_a, k=min(3, len(chunks_a)))
+        sample_b = self._pick_doc_chunks(chunks_b, k=min(3, len(chunks_b)))
+
+        best = None
+        best_score = -1
+
+        for ca in sample_a:
+            ta = set(self.tokenizer.tokenize(ca.content))
+            for cb in sample_b:
+                tb = set(self.tokenizer.tokenize(cb.content))
+                score = len(ta & tb)
+                if score > best_score:
+                    best_score = score
+                    best = (ca, cb)
+
+        if not best:
+            return None
+
+        return [self._ctx_from_chunk(best[0]), self._ctx_from_chunk(best[1])]
+
+    def _build_corpus_outline(self, chunks: List[Chunk], max_files: int = 30, max_headers_per_file: int = 6) -> str:
+        file_headers = defaultdict(list)
+
+        for c in chunks:
+            fn = c.metadata.get("filename", c.doc_id)
+            header = first_header_line(c.header_context, 120) if c.header_context else ""
+            if header and header not in file_headers[fn]:
+                file_headers[fn].append(header)
+
+        lines = []
+        for i, (fn, headers) in enumerate(sorted(file_headers.items())[:max_files], 1):
+            line = f"{i}. {fn}"
+            if headers:
+                line += " | 章节: " + " ; ".join(headers[:max_headers_per_file])
+            lines.append(line)
+
+        outline = "\n".join(lines)
+        return outline[:4000]
+
+    def _build_context_for_judge(self, results: List[SearchResult]) -> str:
+        if not results:
+            return "(无检索结果)"
+
+        parts = []
+        for i, r in enumerate(results, 1):
+            source = r.chunk.metadata.get("filename", r.chunk.doc_id)
+            part = f"[片段{i}] 来源: {source}\n"
+            if r.chunk.header_context:
+                part += f"章节:\n{r.chunk.header_context}\n"
+            part += f"内容:\n{r.chunk.content}"
+            parts.append(part)
+
+        return "\n\n-----\n\n".join(parts)
+
+    # --------------------------------------------------------
+    # 基础三类：普通 / 消歧 / 负样本
+    # --------------------------------------------------------
+    def _generate_positive_case(self, chunk: Chunk) -> Optional[TestCase]:
+        prompt = f"""
+你要为一个 RAG 系统生成 1 条“可回答”的评测样本。
+要求：
+1. 只能依据给定文档片段，不能编造
+2. 问题要像真实用户提问，不要写“根据上述内容”
+3. 问题不要直接照抄原文句子
+4. answer 必须简洁准确，尽量 1~3 句话
+5. evidence 必须是片段中的原句或连续片段
+6. 如果片段不适合出题，返回 {{"skip": true}}
+7. 只输出 JSON 对象，不要解释
+
+输出格式：
+{{
+  "question": "...",
+  "answer": "...",
+  "evidence": "...",
+  "case_type": "definition|factoid|howto|constraint|parameter|comparison",
+  "difficulty": "easy|medium|hard"
+}}
+
+文档名：{chunk.metadata.get("filename", "unknown")}
+章节：
+{chunk.header_context or "(无)"}
+
+文档片段：
+{chunk.content}
+        """.strip()
+
+        raw = self.llm.chat(
+            [{"role": "system", "content": "你是严格的 RAG 评测样本生成助手，只输出 JSON。"},
+             {"role": "user", "content": prompt}],
+            max_tokens=800,
+            temperature=0.2
+        )
+
+        if raw.startswith("LLM 错误:"):
+            return None
+
+        try:
+            obj = self._extract_json(raw)
+            if isinstance(obj, list):
+                obj = obj[0] if obj else {}
+
+            base_type = str(obj.get("case_type", "factoid")).strip() or "factoid"
+            ctx = [self._ctx_from_chunk(chunk)]
+            return self._build_answer_case(
+                obj=obj,
+                contexts=ctx,
+                case_type=base_type,
+                tags=["single_source"]
+            )
+        except Exception:
+            return None
+
+    def _generate_disambiguation_case(self, chunk: Chunk) -> Optional[TestCase]:
+        prompt = f"""
+你要为一个 RAG 系统生成 1 条“消歧/区分”评测样本。
+要求：
+1. 问题必须要求区分两个容易混淆的对象、条件、参数、阶段、选项或概念
+2. 答案必须能完全从给定片段中得到
+3. evidence 必须是片段中的原句或连续片段
+4. 如果片段不适合生成消歧题，返回 {{"skip": true}}
+5. 只输出 JSON 对象，不要解释
+
+输出格式：
+{{
+  "question": "...",
+  "answer": "...",
+  "evidence": "...",
+  "difficulty": "medium|hard"
+}}
+
+文档名：{chunk.metadata.get("filename", "unknown")}
+章节：
+{chunk.header_context or "(无)"}
+
+文档片段：
+{chunk.content}
+        """.strip()
+
+        raw = self.llm.chat(
+            [{"role": "system", "content": "你是严格的 RAG 消歧样本生成助手，只输出 JSON。"},
+             {"role": "user", "content": prompt}],
+            max_tokens=900,
+            temperature=0.2
+        )
+
+        if raw.startswith("LLM 错误:"):
+            return None
+
+        try:
+            obj = self._extract_json(raw)
+            if isinstance(obj, list):
+                obj = obj[0] if obj else {}
+            ctx = [self._ctx_from_chunk(chunk)]
+            return self._build_answer_case(
+                obj=obj,
+                contexts=ctx,
+                case_type="disambiguation",
+                tags=["single_source", "disambiguation"]
+            )
+        except Exception:
+            return None
+
+    def _validate_negative_question(self, question: str, top_k: int = 5) -> bool:
+        results = self.store.search(question, top_k=top_k, verbose=False)
+        if not results:
+            return True
+
+        context = self._build_context_for_judge(results)
+
+        prompt = f"""
+你是 RAG 评测审查员。
+请判断“问题”是否可以仅根据“上下文”得到明确答案。
+
+判定规则：
+1. 只有当上下文中存在明确、直接、充分的信息时，answerable 才为 true
+2. 如果只能部分推测、需要外部知识、上下文只相关但不够回答、或问题更具体，则 answerable 必须为 false
+3. 只输出 JSON，不要解释
+
+输出格式：
+{{"answerable": true/false, "reason": "..."}}
+
+问题：
+{question}
+
+上下文：
+{context}
+        """.strip()
+
+        raw = self.llm.chat(
+            [{"role": "system", "content": "你是严格的 RAG 答案可得性审查员，只输出 JSON。"},
+             {"role": "user", "content": prompt}],
+            max_tokens=400,
+            temperature=0.1
+        )
+
+        if raw.startswith("LLM 错误:"):
+            return False
+
+        try:
+            obj = self._extract_json(raw)
+            if isinstance(obj, list):
+                obj = obj[0] if obj else {}
+            if not isinstance(obj, dict):
+                return False
+            return not bool(obj.get("answerable", False))
+        except Exception:
+            return False
+
+    def _generate_negative_case(self, chunk: Chunk, corpus_outline: str, max_attempts: int = 3) -> Optional[TestCase]:
+        for _ in range(max_attempts):
+            prompt = f"""
+你要为一个 RAG 系统生成 1 条“负样本拒答”评测问题。
+要求：
+1. 问题主题必须与知识库相关，看起来像真实用户会问的
+2. 但根据下面提供的知识库纲要和片段，无法得到明确答案
+3. 不要生成和主题完全无关的问题
+4. 不要写成“文档里有没有提到xxx”
+5. 不要给出答案，只给问题
+6. 如果做不到，返回 {{"skip": true}}
+7. 只输出 JSON 对象，不要解释
+
+输出格式：
+{{
+  "question": "...",
+  "difficulty": "easy|medium|hard"
+}}
+
+知识库纲要：
+{corpus_outline}
+
+参考片段（用于保持主题相关，但问题不能被其回答）：
+文档名：{chunk.metadata.get("filename", "unknown")}
+章节：
+{chunk.header_context or "(无)"}
+片段：
+{chunk.content}
+            """.strip()
+
+            raw = self.llm.chat(
+                [{"role": "system", "content": "你是严格的 RAG 负样本问题生成助手，只输出 JSON。"},
+                 {"role": "user", "content": prompt}],
+                max_tokens=500,
+                temperature=0.3
+            )
+
+            if raw.startswith("LLM 错误:"):
+                return None
+
+            try:
+                obj = self._extract_json(raw)
+                if isinstance(obj, list):
+                    obj = obj[0] if obj else {}
+
+                if not isinstance(obj, dict) or obj.get("skip"):
+                    continue
+
+                question = str(obj.get("question", "")).strip()
+                difficulty = str(obj.get("difficulty", "medium")).strip() or "medium"
+                if not question or len(question) < 6:
+                    continue
+
+                if not self._validate_negative_question(question, top_k=5):
+                    continue
+
+                origin_path = chunk.metadata.get("source", "")
+                case_id = self._make_case_id("negative", question, [f"{origin_path}#{chunk.chunk_id}"])
+
+                return TestCase(
+                    case_id=case_id,
+                    question=question,
+                    expected_behavior="refuse",
+                    expected_answer=self.refusal_answer,
+                    evidence="",
+                    case_type="negative_refusal",
+                    difficulty=difficulty,
+                    source_doc="",
+                    source_path="",
+                    source_chunk_id=-1,
+                    source_header="",
+                    origin_doc=chunk.metadata.get("filename", chunk.doc_id),
+                    origin_path=origin_path,
+                    origin_chunk_id=chunk.chunk_id,
+                    origin_header=chunk.header_context,
+                    gold_sources=[],
+                    tags=["negative"]
+                )
+            except Exception:
+                continue
+
+        return None
+
+    # --------------------------------------------------------
+    # 高级题型
+    # --------------------------------------------------------
+    def _generate_doc_synthesis_case(self, doc_path: str) -> Optional[TestCase]:
+        doc_chunks = [c for c in self.doc_chunks.get(doc_path, []) if self._is_good_chunk(c, 80)]
+        if len(doc_chunks) < 2:
+            return None
+
+        picked = self._pick_doc_chunks(doc_chunks, k=min(3, len(doc_chunks)))
+        contexts = [self._ctx_from_chunk(c) for c in picked]
+
+        prompt = f"""
+你要为一个 RAG 系统生成 1 条“文档综合”评测样本。
+要求：
+1. 问题必须需要综合同一文档中至少两个不同片段/章节才能回答
+2. 不能只靠任意一个来源单独回答完整
+3. answer 必须能完全从给定来源得到
+4. evidence_list 必须分别给出来自不同 source_index 的证据
+5. 只输出 JSON
+6. 如果不适合，返回 {{"skip": true}}
+
+输出格式：
+{{
+  "question": "...",
+  "answer": "...",
+  "evidence_list": [
+    {{"source_index": 1, "evidence": "..."}},
+    {{"source_index": 2, "evidence": "..."}}
+  ],
+  "difficulty": "medium|hard"
+}}
+
+来源：
+{self._format_contexts(contexts)}
+        """.strip()
+
+        raw = self.llm.chat(
+            [{"role": "system", "content": "你是严格的 RAG 文档综合题生成助手，只输出 JSON。"},
+             {"role": "user", "content": prompt}],
+            max_tokens=1000,
+            temperature=0.2
+        )
+
+        if raw.startswith("LLM 错误:"):
+            return None
+
+        try:
+            obj = self._extract_json(raw)
+            if isinstance(obj, list):
+                obj = obj[0] if obj else {}
+            return self._build_answer_case(
+                obj=obj,
+                contexts=contexts,
+                case_type="doc_synthesis",
+                tags=["multi_source", "same_doc"],
+                require_multi_source=True
+            )
+        except Exception:
+            return None
+
+    def _generate_cross_doc_synthesis_case(self, doc_a: str, doc_b: str) -> Optional[TestCase]:
+        contexts = self._pick_best_cross_doc_pair(doc_a, doc_b)
+        if not contexts or len(contexts) < 2:
+            return None
+
+        prompt = f"""
+你要为一个 RAG 系统生成 1 条“跨文档综合”评测样本。
+要求：
+1. 问题必须需要同时综合两个不同文档的内容才能回答
+2. 不能只依赖任意一个文档单独完整回答
+3. answer 必须完全可由给定来源支持
+4. evidence_list 必须分别包含两个来源的证据
+5. 只输出 JSON
+6. 如果不适合，返回 {{"skip": true}}
+
+输出格式：
+{{
+  "question": "...",
+  "answer": "...",
+  "evidence_list": [
+    {{"source_index": 1, "evidence": "..."}},
+    {{"source_index": 2, "evidence": "..."}}
+  ],
+  "difficulty": "medium|hard"
+}}
+
+来源：
+{self._format_contexts(contexts)}
+        """.strip()
+
+        raw = self.llm.chat(
+            [{"role": "system", "content": "你是严格的 RAG 跨文档综合题生成助手，只输出 JSON。"},
+             {"role": "user", "content": prompt}],
+            max_tokens=1000,
+            temperature=0.2
+        )
+
+        if raw.startswith("LLM 错误:"):
+            return None
+
+        try:
+            obj = self._extract_json(raw)
+            if isinstance(obj, list):
+                obj = obj[0] if obj else {}
+            return self._build_answer_case(
+                obj=obj,
+                contexts=contexts,
+                case_type="cross_doc_synthesis",
+                tags=["multi_source", "cross_doc"],
+                require_multi_source=True
+            )
+        except Exception:
+            return None
+
+    def _generate_semantic_paraphrase_case(self, chunk: Chunk) -> Optional[TestCase]:
+        contexts = [self._ctx_from_chunk(chunk)]
+
+        prompt = f"""
+你要为一个 RAG 系统生成 1 条“语义改写型”评测样本。
+要求：
+1. 问题必须可由给定来源回答
+2. 但提问方式要与原文用词明显不同，不能直接照抄文档关键词或句式
+3. 尽量从用户目标、现象、场景、结果角度提问
+4. evidence 必须是原文证据
+5. 如果做不到，返回 {{"skip": true}}
+6. 只输出 JSON
+
+输出格式：
+{{
+  "question": "...",
+  "answer": "...",
+  "evidence": "...",
+  "difficulty": "medium|hard"
+}}
+
+来源：
+{self._format_contexts(contexts)}
+        """.strip()
+
+        raw = self.llm.chat(
+            [{"role": "system", "content": "你是严格的 RAG 语义改写题生成助手，只输出 JSON。"},
+             {"role": "user", "content": prompt}],
+            max_tokens=900,
+            temperature=0.3
+        )
+
+        if raw.startswith("LLM 错误:"):
+            return None
+
+        try:
+            obj = self._extract_json(raw)
+            if isinstance(obj, list):
+                obj = obj[0] if obj else {}
+            return self._build_answer_case(
+                obj=obj,
+                contexts=contexts,
+                case_type="semantic_paraphrase",
+                tags=["paraphrase", "single_source"],
+                require_paraphrase=True
+            )
+        except Exception:
+            return None
+
+    def _generate_reasoning_case(self, chunk: Chunk) -> Optional[TestCase]:
+        contexts = [self._ctx_from_chunk(chunk)]
+
+        prompt = f"""
+你要为一个 RAG 系统生成 1 条“推理型”评测样本。
+要求：
+1. 问题必须可由给定来源回答
+2. 但答案不能只是直接摘抄一句话，应至少需要条件判断、比较、归纳、顺序推断或简单计算
+3. evidence 必须是支撑推理的原文证据
+4. 如果不适合，返回 {{"skip": true}}
+5. 只输出 JSON
+
+输出格式：
+{{
+  "question": "...",
+  "answer": "...",
+  "evidence": "...",
+  "difficulty": "medium|hard"
+}}
+
+来源：
+{self._format_contexts(contexts)}
+        """.strip()
+
+        raw = self.llm.chat(
+            [{"role": "system", "content": "你是严格的 RAG 推理题生成助手，只输出 JSON。"},
+             {"role": "user", "content": prompt}],
+            max_tokens=900,
+            temperature=0.2
+        )
+
+        if raw.startswith("LLM 错误:"):
+            return None
+
+        try:
+            obj = self._extract_json(raw)
+            if isinstance(obj, list):
+                obj = obj[0] if obj else {}
+            return self._build_answer_case(
+                obj=obj,
+                contexts=contexts,
+                case_type="reasoning",
+                tags=["reasoning", "single_source"],
+                require_reasoning=True
+            )
+        except Exception:
+            return None
+
+    def _generate_multi_hop_case(self, doc_a: str, doc_b: str) -> Optional[TestCase]:
+        contexts = self._pick_best_cross_doc_pair(doc_a, doc_b)
+        if not contexts or len(contexts) < 2:
+            return None
+
+        prompt = f"""
+你要为一个 RAG 系统生成 1 条“多跳问题”评测样本。
+要求：
+1. 问题必须需要先从一个来源得到中间事实，再结合另一个来源得到最终答案
+2. 问题应体现两步以上的链式推理，而不是简单拼接
+3. 不能只靠任意单个来源完整回答
+4. answer 必须完全由给定来源支持
+5. evidence_list 必须分别给出不同来源的证据
+6. 如果不适合，返回 {{"skip": true}}
+7. 只输出 JSON
+
+输出格式：
+{{
+  "question": "...",
+  "answer": "...",
+  "evidence_list": [
+    {{"source_index": 1, "evidence": "..."}},
+    {{"source_index": 2, "evidence": "..."}}
+  ],
+  "difficulty": "hard"
+}}
+
+来源：
+{self._format_contexts(contexts)}
+        """.strip()
+
+        raw = self.llm.chat(
+            [{"role": "system", "content": "你是严格的 RAG 多跳题生成助手，只输出 JSON。"},
+             {"role": "user", "content": prompt}],
+            max_tokens=1000,
+            temperature=0.2
+        )
+
+        if raw.startswith("LLM 错误:"):
+            return None
+
+        try:
+            obj = self._extract_json(raw)
+            if isinstance(obj, list):
+                obj = obj[0] if obj else {}
+            return self._build_answer_case(
+                obj=obj,
+                contexts=contexts,
+                case_type="multi_hop",
+                tags=["multi_source", "cross_doc", "reasoning", "multi_hop"],
+                require_multi_source=True,
+                require_reasoning=True
+            )
+        except Exception:
+            return None
+
+    def _generate_semiconductor_alias_case(self, chunk: Chunk) -> Optional[TestCase]:
+        if not self._is_semiconductor_candidate(chunk):
+            return None
+
+        contexts = [self._ctx_from_chunk(chunk)]
+        glossary_text = "\n".join(
+            [f"- {k}: {', '.join(v)}" for k, v in self.SEMICON_GLOSSARY.items()]
+        )
+
+        prompt = f"""
+你要为一个 RAG 系统生成 1 条“半导体术语别名/黑话”评测样本。
+要求：
+1. 问题必须仍然可由给定来源回答
+2. 提问时尽量使用半导体领域常见别名、英文缩写、黑话、口语说法，而不是直接沿用文档中的主表达
+3. used_alias_terms 必须列出问题中实际使用的别名/黑话术语
+4. 至少使用 1 个与原文表述不同的术语；如果做不到，返回 {{"skip": true}}
+5. evidence 必须是原文证据
+6. 只输出 JSON
+
+参考术语表：
+{glossary_text}
+
+输出格式：
+{{
+  "question": "...",
+  "answer": "...",
+  "evidence": "...",
+  "used_alias_terms": ["...", "..."],
+  "difficulty": "medium|hard"
+}}
+
+来源：
+{self._format_contexts(contexts)}
+        """.strip()
+
+        raw = self.llm.chat(
+            [{"role": "system", "content": "你是严格的半导体领域 RAG 测试样本生成助手，只输出 JSON。"},
+             {"role": "user", "content": prompt}],
+            max_tokens=1000,
+            temperature=0.3
+        )
+
+        if raw.startswith("LLM 错误:"):
+            return None
+
+        try:
+            obj = self._extract_json(raw)
+            if isinstance(obj, list):
+                obj = obj[0] if obj else {}
+            return self._build_answer_case(
+                obj=obj,
+                contexts=contexts,
+                case_type="semiconductor_alias",
+                tags=["semiconductor", "alias", "paraphrase"],
+                require_paraphrase=True,
+                require_alias=True
+            )
+        except Exception:
+            return None
+
+    # --------------------------------------------------------
+    # 生成入口
+    # --------------------------------------------------------
+    def generate_from_chunks(self,
+                             chunks: List[Chunk],
+                             max_positive: int = 40,
+                             max_disamb: int = 15,
+                             max_negative: int = 20,
+                             max_doc_synth: int = 10,
+                             max_cross_doc: int = 10,
+                             max_semantic: int = 10,
+                             max_reasoning: int = 10,
+                             max_multihop: int = 10,
+                             max_semiconductor: int = 10,
+                             seed: int = 42,
+                             min_chunk_chars: int = 120) -> List[TestCase]:
+        random.seed(seed)
+
+        candidates = [c for c in chunks if self._is_good_chunk(c, min_chunk_chars)]
+        random.shuffle(candidates)
+
+        print(f"\n开始生成测试集，候选 chunk 数量: {len(candidates)}")
+
+        seen_questions = set()
+        all_cases = []
+
+        def try_add(tc: Optional[TestCase], bucket_name: str, current: int, target: int):
+            if not tc:
+                return False
+            qn = normalize_text(tc.question)
+            if qn in seen_questions:
+                return False
+            seen_questions.add(qn)
+            all_cases.append(tc)
+            print(f"  [{bucket_name}] {current + 1}/{target}")
+            return True
+
+        # 1) 普通题
+        count = 0
+        for chunk in candidates:
+            if count >= max_positive:
+                break
+            tc = self._generate_positive_case(chunk)
+            if try_add(tc, "普通样本", count, max_positive):
+                count += 1
+
+        # 2) 消歧题
+        disamb_candidates = [c for c in candidates if self._is_disamb_candidate(c)]
+        random.shuffle(disamb_candidates)
+        count = 0
+        for chunk in disamb_candidates:
+            if count >= max_disamb:
+                break
+            tc = self._generate_disambiguation_case(chunk)
+            if try_add(tc, "消歧样本", count, max_disamb):
+                count += 1
+
+        # 3) 文档综合题
+        doc_candidates = [
+            p for p, chs in self.doc_chunks.items()
+            if len([c for c in chs if self._is_good_chunk(c, 80)]) >= 2
+        ]
+        random.shuffle(doc_candidates)
+
+        count = 0
+        for doc_path in doc_candidates:
+            if count >= max_doc_synth:
+                break
+            tc = self._generate_doc_synthesis_case(doc_path)
+            if try_add(tc, "文档综合", count, max_doc_synth):
+                count += 1
+
+        # 4) 跨文档综合题
+        cross_doc_candidates = [
+            p for p, chs in self.doc_chunks.items()
+            if len([c for c in chs if self._is_good_chunk(c, 80)]) >= 1
+        ]
+        doc_pairs = self._rank_doc_pairs(cross_doc_candidates)
+
+        count = 0
+        for doc_a, doc_b, _score in doc_pairs:
+            if count >= max_cross_doc:
+                break
+            tc = self._generate_cross_doc_synthesis_case(doc_a, doc_b)
+            if try_add(tc, "跨文档综合", count, max_cross_doc):
+                count += 1
+
+        # 5) 语义改写题
+        count = 0
+        for chunk in candidates:
+            if count >= max_semantic:
+                break
+            tc = self._generate_semantic_paraphrase_case(chunk)
+            if try_add(tc, "语义改写", count, max_semantic):
+                count += 1
+
+        # 6) 推理题
+        reasoning_candidates = [c for c in candidates if self._is_reasoning_candidate(c)]
+        random.shuffle(reasoning_candidates)
+        count = 0
+        for chunk in reasoning_candidates:
+            if count >= max_reasoning:
+                break
+            tc = self._generate_reasoning_case(chunk)
+            if try_add(tc, "推理题", count, max_reasoning):
+                count += 1
+
+        # 7) 多跳题
+        count = 0
+        for doc_a, doc_b, _score in doc_pairs:
+            if count >= max_multihop:
+                break
+            tc = self._generate_multi_hop_case(doc_a, doc_b)
+            if try_add(tc, "多跳题", count, max_multihop):
+                count += 1
+
+        # 8) 半导体术语别名题
+        semicon_candidates = [c for c in candidates if self._is_semiconductor_candidate(c)]
+        random.shuffle(semicon_candidates)
+        count = 0
+        for chunk in semicon_candidates:
+            if count >= max_semiconductor:
+                break
+            tc = self._generate_semiconductor_alias_case(chunk)
+            if try_add(tc, "半导体别名", count, max_semiconductor):
+                count += 1
+
+        # 9) 负样本
+        corpus_outline = self._build_corpus_outline(chunks)
+        count = 0
+        for chunk in candidates:
+            if count >= max_negative:
+                break
+            tc = self._generate_negative_case(chunk, corpus_outline, max_attempts=3)
+            if try_add(tc, "负样本", count, max_negative):
+                count += 1
+
+        random.shuffle(all_cases)
+
+        type_counter = Counter(c.case_type for c in all_cases)
+        print("\n测试集生成完成：")
+        for k, v in sorted(type_counter.items()):
+            print(f"  {k}: {v}")
+        print(f"  总计: {len(all_cases)}")
+
+        return all_cases
+
+    @staticmethod
+    def save_jsonl(cases: List[TestCase], path: str):
+        with open(path, "w", encoding="utf-8") as f:
+            for case in cases:
+                f.write(json.dumps(asdict(case), ensure_ascii=False) + "\n")
+        print(f"\n测试集已保存到: {path}")
+
+    @staticmethod
+    def load_jsonl(path: str) -> List[TestCase]:
+        cases = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                obj.setdefault("gold_sources", [])
+                obj.setdefault("tags", [])
+                cases.append(TestCase(**obj))
+        return cases
+
+# ============================================================
+# 评估器
+# ============================================================
+class RAGEvaluator:
+    def __init__(self, rag: RAG):
+        self.rag = rag
+
+    @staticmethod
+    def char_f1(pred: str, gold: str) -> float:
+        pred_chars = list(normalize_text(pred))
+        gold_chars = list(normalize_text(gold))
+
+        if not pred_chars or not gold_chars:
+            return 0.0
+
+        common = Counter(pred_chars) & Counter(gold_chars)
+        same = sum(common.values())
+        if same == 0:
+            return 0.0
+
+        precision = same / len(pred_chars)
+        recall = same / len(gold_chars)
+        return 2 * precision * recall / (precision + recall)
+
+    @staticmethod
+    def is_refusal(answer: str) -> bool:
+        if not answer:
+            return False
+
+        text = answer.strip()
+        patterns = [
+            r"没有找到相关信息",
+            r"无法根据提供的文档",
+            r"文档中未提及",
+            r"上下文.*不足",
+            r"无法确定",
+            r"未提供相关信息"
+        ]
+        return any(re.search(p, text) for p in patterns)
+
+    @staticmethod
+    def summarize_testset(cases: List[TestCase]) -> Dict:
+        by_case_type = Counter(c.case_type for c in cases)
+        by_behavior = Counter(c.expected_behavior for c in cases)
+        by_doc = Counter(get_case_doc_group(c) for c in cases if c.expected_behavior == "answer")
+        by_tags = Counter(t for c in cases for t in c.tags)
+
+        multi_source_case_count = sum(
+            1 for c in cases
+            if c.expected_behavior == "answer" and len(get_case_gold_sources(c)) > 1
+        )
+
+        return {
+            "count": len(cases),
+            "multi_source_case_count": multi_source_case_count,
+            "by_case_type": dict(sorted(by_case_type.items())),
+            "by_expected_behavior": dict(sorted(by_behavior.items())),
+            "top_source_groups": dict(by_doc.most_common(20)),
+            "top_tags": dict(by_tags.most_common(30))
+        }
+
+    def evaluate_retrieval(self, cases: List[TestCase], top_k: int = 5) -> Tuple[Dict, List[Dict]]:
+        answerable = [c for c in cases if c.expected_behavior == "answer" and get_case_gold_sources(c)]
+        if not answerable:
+            return {"count": 0}, []
+
+        details = []
+        all_hit_count = 0
+        any_hit_count = 0
+        coverage_sum = 0.0
+        rr_sum = 0.0
+        multi_source_case_count = 0
+
+        for idx, tc in enumerate(answerable, 1):
+            golds = get_case_gold_sources(tc)
+            if len(golds) > 1:
+                multi_source_case_count += 1
+
+            gold_keys = {(g["source_path"], int(g["chunk_id"])) for g in golds}
+            results = self.rag.retrieve(tc.question, top_k=top_k, verbose=False)
+
+            rank_map = {}
+            top_results = []
+
+            for rank, r in enumerate(results, 1):
+                res_key = (r.chunk.metadata.get("source", ""), int(r.chunk.chunk_id))
+                top_results.append({
+                    "rank": rank,
+                    "source_doc": r.chunk.metadata.get("filename", r.chunk.doc_id),
+                    "source_path": r.chunk.metadata.get("source", ""),
+                    "chunk_id": int(r.chunk.chunk_id),
+                    "score": round(r.score, 6)
+                })
+                if res_key in gold_keys and res_key not in rank_map:
+                    rank_map[res_key] = rank
+
+            matched_keys = set(rank_map.keys())
+            coverage = len(matched_keys) / len(gold_keys) if gold_keys else 0.0
+            all_hit = int(len(matched_keys) == len(gold_keys) and len(gold_keys) > 0)
+            any_hit = int(len(matched_keys) > 0)
+            first_rank = min(rank_map.values()) if rank_map else 0
+            rr = 1.0 / first_rank if first_rank else 0.0
+
+            all_hit_count += all_hit
+            any_hit_count += any_hit
+            coverage_sum += coverage
+            rr_sum += rr
+
+            details.append({
+                "case_id": tc.case_id,
+                "question": tc.question,
+                "case_type": tc.case_type,
+                "source_group": get_case_doc_group(tc),
+                "header_group": get_case_header_group(tc),
+                "gold_source_count": len(gold_keys),
+                "matched_source_count": len(matched_keys),
+                "support_coverage": round(coverage, 4),
+                "all_support_hit": bool(all_hit),
+                "any_support_hit": bool(any_hit),
+                "first_support_rank": first_rank,
+                "top_results": top_results
+            })
+
+            if idx % 10 == 0 or idx == len(answerable):
+                print(f"[检索评估] {idx}/{len(answerable)}")
+
+        summary = {
+            "count": len(answerable),
+            "multi_source_case_count": multi_source_case_count,
+            f"recall@{top_k}": round(all_hit_count / len(answerable), 4),
+            f"all_support_hit_rate@{top_k}": round(all_hit_count / len(answerable), 4),
+            f"any_support_hit_rate@{top_k}": round(any_hit_count / len(answerable), 4),
+            f"avg_support_coverage@{top_k}": round(coverage_sum / len(answerable), 4),
+            f"mrr_first_support@{top_k}": round(rr_sum / len(answerable), 4)
+        }
+        return summary, details
+
+    def evaluate_generation(self, cases: List[TestCase], top_k: int = 5) -> Tuple[Dict, List[Dict]]:
+        details = []
+
+        ans_total = 0
+        ans_contain_hit = 0
+        ans_f1_sum = 0.0
+
+        neg_total = 0
+        neg_refusal_hit = 0
+
+        for idx, tc in enumerate(cases, 1):
+            answer, _ = self.rag.query(tc.question, top_k=top_k, verbose=False)
+
+            if tc.expected_behavior == "refuse":
+                neg_total += 1
+                refusal_ok = int(self.is_refusal(answer))
+                neg_refusal_hit += refusal_ok
+
+                details.append({
+                    "case_id": tc.case_id,
+                    "question": tc.question,
+                    "case_type": tc.case_type,
+                    "expected_behavior": "refuse",
+                    "source_group": get_case_doc_group(tc),
+                    "header_group": get_case_header_group(tc),
+                    "pred_answer": answer,
+                    "refusal_ok": refusal_ok,
+                    "tags": tc.tags
+                })
+            else:
+                ans_total += 1
+                pred_norm = normalize_text(answer)
+                gold_norm = normalize_text(tc.expected_answer)
+
+                contain = int(gold_norm in pred_norm) if gold_norm else 0
+                f1 = self.char_f1(answer, tc.expected_answer)
+
+                ans_contain_hit += contain
+                ans_f1_sum += f1
+
+                details.append({
+                    "case_id": tc.case_id,
+                    "question": tc.question,
+                    "case_type": tc.case_type,
+                    "expected_behavior": "answer",
+                    "source_group": get_case_doc_group(tc),
+                    "header_group": get_case_header_group(tc),
+                    "expected_answer": tc.expected_answer,
+                    "pred_answer": answer,
+                    "answer_contain_hit": contain,
+                    "char_f1": round(f1, 4),
+                    "tags": tc.tags
+                })
+
+            if idx % 5 == 0 or idx == len(cases):
+                print(f"[回答评估] {idx}/{len(cases)}")
+
+        summary = {
+            "answerable_count": ans_total,
+            "answerable_contain_rate": round(ans_contain_hit / ans_total, 4) if ans_total else 0.0,
+            "answerable_avg_char_f1": round(ans_f1_sum / ans_total, 4) if ans_total else 0.0,
+            "negative_count": neg_total,
+            "negative_refusal_rate": round(neg_refusal_hit / neg_total, 4) if neg_total else 0.0
+        }
+        return summary, details
+
+    def build_retrieval_grouped_report(self, cases: List[TestCase], details: List[Dict], top_k: int = 5) -> Dict:
+        by_case_type = defaultdict(lambda: {"count": 0, "all_hit": 0, "any_hit": 0, "coverage_sum": 0.0, "rr_sum": 0.0})
+        by_source_doc = defaultdict(lambda: {"count": 0, "all_hit": 0, "any_hit": 0, "coverage_sum": 0.0, "rr_sum": 0.0})
+        by_source_header = defaultdict(lambda: {"count": 0, "all_hit": 0, "any_hit": 0, "coverage_sum": 0.0, "rr_sum": 0.0})
+
+        for d in details:
+            case_type = d["case_type"]
+            source_doc = d["source_group"]
+            source_header = d["header_group"]
+            all_hit = int(d["all_support_hit"])
+            any_hit = int(d["any_support_hit"])
+            coverage = float(d["support_coverage"])
+            rr = 1.0 / d["first_support_rank"] if d["first_support_rank"] else 0.0
+
+            for agg, key in [
+                (by_case_type, case_type),
+                (by_source_doc, source_doc),
+                (by_source_header, source_header)
+            ]:
+                agg[key]["count"] += 1
+                agg[key]["all_hit"] += all_hit
+                agg[key]["any_hit"] += any_hit
+                agg[key]["coverage_sum"] += coverage
+                agg[key]["rr_sum"] += rr
+
+        def finalize(aggs: Dict[str, Dict]) -> Dict[str, Dict]:
+            out = {}
+            for key, v in aggs.items():
+                count = v["count"]
+                out[key] = {
+                    "count": count,
+                    f"recall@{top_k}": round(v["all_hit"] / count, 4) if count else 0.0,
+                    f"all_support_hit_rate@{top_k}": round(v["all_hit"] / count, 4) if count else 0.0,
+                    f"any_support_hit_rate@{top_k}": round(v["any_hit"] / count, 4) if count else 0.0,
+                    f"avg_support_coverage@{top_k}": round(v["coverage_sum"] / count, 4) if count else 0.0,
+                    f"mrr_first_support@{top_k}": round(v["rr_sum"] / count, 4) if count else 0.0
+                }
+            return sort_metric_dict(out, primary_key="count")
+
+        return {
+            "by_case_type": finalize(by_case_type),
+            "by_source_doc": finalize(by_source_doc),
+            "by_source_header": finalize(by_source_header)
+        }
+
+    def build_generation_grouped_report(self, cases: List[TestCase], details: List[Dict]) -> Dict:
+        ans_by_case_type = defaultdict(lambda: {"count": 0, "contain_hit": 0, "f1_sum": 0.0})
+        ans_by_source_doc = defaultdict(lambda: {"count": 0, "contain_hit": 0, "f1_sum": 0.0})
+        ans_by_source_header = defaultdict(lambda: {"count": 0, "contain_hit": 0, "f1_sum": 0.0})
+        neg_by_case_type = defaultdict(lambda: {"count": 0, "refusal_hit": 0})
+        neg_by_origin_doc = defaultdict(lambda: {"count": 0, "refusal_hit": 0})
+
+        case_map = {c.case_id: c for c in cases}
+
+        for d in details:
+            tc = case_map[d["case_id"]]
+
+            if tc.expected_behavior == "refuse":
+                neg_by_case_type[tc.case_type]["count"] += 1
+                neg_by_case_type[tc.case_type]["refusal_hit"] += int(d.get("refusal_ok", 0))
+
+                origin_label = tc.origin_doc or "(未知来源)"
+                neg_by_origin_doc[origin_label]["count"] += 1
+                neg_by_origin_doc[origin_label]["refusal_hit"] += int(d.get("refusal_ok", 0))
+            else:
+                source_doc = get_case_doc_group(tc)
+                source_header = get_case_header_group(tc)
+
+                for agg, key in [
+                    (ans_by_case_type, tc.case_type),
+                    (ans_by_source_doc, source_doc),
+                    (ans_by_source_header, source_header)
+                ]:
+                    agg[key]["count"] += 1
+                    agg[key]["contain_hit"] += int(d.get("answer_contain_hit", 0))
+                    agg[key]["f1_sum"] += float(d.get("char_f1", 0.0))
+
+        def finalize_answer(aggs: Dict[str, Dict]) -> Dict[str, Dict]:
+            out = {}
+            for key, v in aggs.items():
+                count = v["count"]
+                out[key] = {
+                    "count": count,
+                    "answer_contain_rate": round(v["contain_hit"] / count, 4) if count else 0.0,
+                    "avg_char_f1": round(v["f1_sum"] / count, 4) if count else 0.0
+                }
+            return sort_metric_dict(out, primary_key="count")
+
+        def finalize_refuse(aggs: Dict[str, Dict]) -> Dict[str, Dict]:
+            out = {}
+            for key, v in aggs.items():
+                count = v["count"]
+                out[key] = {
+                    "count": count,
+                    "negative_refusal_rate": round(v["refusal_hit"] / count, 4) if count else 0.0
+                }
+            return sort_metric_dict(out, primary_key="count")
+
+        return {
+            "answerable_by_case_type": finalize_answer(ans_by_case_type),
+            "answerable_by_source_doc": finalize_answer(ans_by_source_doc),
+            "answerable_by_source_header": finalize_answer(ans_by_source_header),
+            "negative_by_case_type": finalize_refuse(neg_by_case_type),
+            "negative_by_origin_doc": finalize_refuse(neg_by_origin_doc)
+        }
+
+    @staticmethod
+    def save_report(path: str, report: Dict):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        print(f"\n评估报告已保存到: {path}")
+
+# ============================================================
+# 主程序
+# ============================================================
+def main():
+    print("""
+╔══════════════════════════════════════════════════════════╗
+║           RAG 知识问答系统（增强版）                      ║
+║  - Markdown智能分块                                       ║
+║  - 混合检索 (BM25 + 向量)                                 ║
+║  - 无查询重写                                             ║
+╚══════════════════════════════════════════════════════════╝
+""")
+
+    try:
+        rag = RAG()
+    except Exception as e:
+        print(f"❌ 初始化失败: {e}")
+        return
+
+    if KNOWLEDGE_SOURCE:
+        rag.load_knowledge(KNOWLEDGE_SOURCE)
+    else:
+        print("⚠️ 未配置知识源，请使用 /add 命令添加文档")
+
+    rag.interactive()
+
+
+if __name__ == "__main__":
+    main()
