@@ -1,0 +1,1745 @@
+import io
+import os
+import json
+import shutil
+import zipfile
+import traceback
+from pathlib import Path
+from datetime import datetime
+from collections import Counter
+from dataclasses import asdict
+
+import numpy as np
+if not hasattr(np, "bool8"):
+    np.bool8 = np.bool_
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+
+# ============================================================
+# 如果你的后端文件名不是 rag_enhanced_persist_report.py
+# 请把下面这一行改成你的真实文件名
+# ============================================================
+#from rag_enhanced_persist_report import RAG, TestsetGenerator, RAGEvaluator
+from rag_backend import RAG, TestsetGenerator, RAGEvaluator
+
+# ============================================================
+# 页面配置
+# ============================================================
+st.set_page_config(
+    page_title="RAG 测试与评估平台（完整版）",
+    page_icon="🧠",
+    layout="wide"
+)
+
+SUPPORTED_UPLOAD_TYPES = [
+    "txt", "md", "markdown", "json", "py", "html", "csv", "xml", "log", "rst", "zip"
+]
+
+TMP_ROOT = Path(".ui_tmp_streamlit")
+TMP_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+# ============================================================
+# Session 初始化
+# ============================================================
+def ensure_session():
+    defaults = {
+        "main_rag": None,
+        "generated_cases": [],
+        "last_report": None,
+        "last_compare": None,
+        "qa_history": [],
+        "default_sources_text": "",
+        "default_index_dir": "./kb_index",
+        "default_testset_path": "./testset.jsonl",
+        "default_report_path": "./eval_report.json",
+        "upload_root": "./ui_uploaded_kb",
+        "upload_workspace": "workspace_01",
+        "main_vector_weight": 0.6,
+        "main_bm25_weight": 0.4
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+ensure_session()
+
+# ============================================================
+# 工具函数
+# ============================================================
+def parse_sources(text: str):
+    if not text:
+        return []
+    parts = []
+    for line in text.replace("||", "\n").splitlines():
+        line = line.strip()
+        if line:
+            parts.append(line)
+    return parts
+
+
+def now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def get_main_rag():
+    if st.session_state.main_rag is None:
+        st.session_state.main_rag = RAG()
+        sync_weight_inputs_from_rag(st.session_state.main_rag)
+    return st.session_state.main_rag
+
+
+def reset_main_rag():
+    st.session_state.main_rag = RAG()
+    sync_weight_inputs_from_rag(st.session_state.main_rag)
+    return st.session_state.main_rag
+
+
+def sync_weight_inputs_from_rag(rag: RAG):
+    st.session_state.main_vector_weight = float(rag.store.vector_weight)
+    st.session_state.main_bm25_weight = float(rag.store.bm25_weight)
+
+
+def apply_main_weights():
+    rag = get_main_rag()
+    rag.store.vector_weight = float(st.session_state.main_vector_weight)
+    rag.store.bm25_weight = float(st.session_state.main_bm25_weight)
+
+
+def ensure_dir(path: str):
+    p = Path(path).resolve()
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def unique_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    parent = path.parent
+    i = 1
+    while True:
+        candidate = parent / f"{stem}_{i}{suffix}"
+        if not candidate.exists():
+            return candidate
+        i += 1
+
+
+def safe_extract_zip_from_bytes(zip_bytes: bytes, target_dir: Path):
+    extracted = []
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        for member in zf.infolist():
+            if member.is_dir():
+                continue
+
+            member_path = Path(member.filename)
+            if member_path.is_absolute():
+                continue
+            if ".." in member_path.parts:
+                continue
+
+            out_path = target_dir / member_path
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+
+            with zf.open(member) as src, open(out_path, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+
+            extracted.append({
+                "name": member.filename,
+                "saved_to": str(out_path),
+                "size": member.file_size
+            })
+    return extracted
+
+def save_uploaded_files(uploaded_files, workspace_dir: Path, unzip_archives=True):
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    saved_records = []
+
+    for uf in uploaded_files:
+        filename = Path(uf.name).name
+        suffix = Path(filename).suffix.lower()
+
+        if suffix == ".zip" and unzip_archives:
+            extracted = safe_extract_zip_from_bytes(uf.getvalue(), workspace_dir)
+            for item in extracted:
+                saved_records.append({
+                    "type": "zip_member",
+                    "name": item["name"],
+                    "size": item["size"],
+                    "saved_to": item["saved_to"]
+                })
+        else:
+            out_path = unique_path(workspace_dir / filename)
+            with open(out_path, "wb") as f:
+                f.write(uf.getbuffer())
+
+            saved_records.append({
+                "type": "file",
+                "name": filename,
+                "size": uf.size,
+                "saved_to": str(out_path)
+            })
+
+    return saved_records
+
+
+def list_files_recursive(root: Path, limit=1000):
+    rows = []
+    if not root.exists():
+        return rows
+
+    for i, f in enumerate(sorted(root.rglob("*"))):
+        if i >= limit:
+            break
+        if f.is_file():
+            try:
+                size = f.stat().st_size
+            except Exception:
+                size = 0
+            rows.append({
+                "name": f.name,
+                "relative_path": str(f.relative_to(root)),
+                "size": size,
+                "full_path": str(f.resolve())
+            })
+    return rows
+
+def save_uploaded_testset_file(uploaded_file):
+    tmp_dir = ensure_dir(TMP_ROOT / "uploaded_testsets")
+    out_path = unique_path(tmp_dir / uploaded_file.name)
+    with open(out_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    return out_path
+
+
+def store_stats(rag: RAG):
+    chunk_count = len(rag.store)
+    doc_paths = [c.metadata.get("source", c.doc_id) for c in rag.store.chunks]
+    doc_names = [c.metadata.get("filename", c.doc_id) for c in rag.store.chunks]
+    doc_count = len(set(doc_paths))
+    file_counter = Counter(doc_names)
+    bm25_vocab = len(rag.store.bm25.idf)
+    vector_shape = None
+    if rag.store.vectors is not None:
+        vector_shape = list(rag.store.vectors.shape)
+
+    return {
+        "chunk_count": chunk_count,
+        "doc_count": doc_count,
+        "bm25_vocab": bm25_vocab,
+        "vector_shape": vector_shape,
+        "top_docs": dict(file_counter.most_common(30))
+    }
+
+
+def grouped_dict_to_df(grouped: dict, key_name: str = "group"):
+    rows = []
+    for k, v in grouped.items():
+        row = {key_name: k}
+        if isinstance(v, dict):
+            row.update(v)
+        else:
+            row["value"] = v
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def simple_dict_to_df(d: dict, key_name="key", value_name="value"):
+    rows = [{key_name: k, value_name: v} for k, v in d.items()]
+    return pd.DataFrame(rows)
+
+
+def numeric_summary_df(summary: dict):
+    rows = []
+    for k, v in summary.items():
+        if isinstance(v, (int, float)):
+            rows.append({"metric": k, "value": v})
+    return pd.DataFrame(rows)
+
+
+def testcases_to_df(cases, limit=500):
+    rows = []
+    for tc in cases[:limit]:
+        rows.append({
+            "case_id": tc.case_id,
+            "case_type": tc.case_type,
+            "difficulty": tc.difficulty,
+            "expected_behavior": tc.expected_behavior,
+            "question": tc.question,
+            "source_doc": getattr(tc, "source_doc", ""),
+            "origin_doc": getattr(tc, "origin_doc", ""),
+            "gold_source_count": len(getattr(tc, "gold_sources", []) or []),
+            "tags": ", ".join(getattr(tc, "tags", []) or [])
+        })
+    return pd.DataFrame(rows)
+
+def cases_to_jsonl_string(cases):
+    lines = []
+    for c in cases:
+        lines.append(json.dumps(asdict(c), ensure_ascii=False))
+    return "\n".join(lines)
+
+
+def show_metrics_from_summary(summary: dict):
+    numeric_items = [(k, v) for k, v in summary.items() if isinstance(v, (int, float))]
+    if not numeric_items:
+        st.info("暂无 summary")
+        return
+
+    cols = st.columns(min(4, max(1, len(numeric_items))))
+    for i, (k, v) in enumerate(numeric_items):
+        cols[i % len(cols)].metric(k, v)
+
+
+def fig_bar(df, x, y, title, color=None, top_n=None, sort_by=None, ascending=False):
+    if df is None or df.empty or x not in df.columns or y not in df.columns:
+        return None
+
+    work = df.copy()
+    if sort_by and sort_by in work.columns:
+        work = work.sort_values(sort_by, ascending=ascending)
+    elif y in work.columns:
+        work = work.sort_values(y, ascending=ascending)
+
+    if top_n:
+        work = work.head(top_n)
+
+    fig = px.bar(work, x=x, y=y, color=color, title=title, text=y)
+    fig.update_layout(height=420, xaxis_tickangle=-35)
+    return fig
+
+
+def fig_pie(df, names, values, title):
+    if df is None or df.empty or names not in df.columns or values not in df.columns:
+        return None
+    fig = px.pie(df, names=names, values=values, title=title, hole=0.35)
+    fig.update_layout(height=420)
+    return fig
+
+
+def fig_multi_metric(grouped: dict, title: str, metrics: list, top_n=15):
+    df = grouped_dict_to_df(grouped, key_name="group")
+    if df.empty:
+        return None
+
+    use_metrics = [m for m in metrics if m in df.columns]
+    if not use_metrics:
+        return None
+
+    count_col = "count" if "count" in df.columns else use_metrics[0]
+    df = df.sort_values(count_col, ascending=False).head(top_n)
+    melt_df = df.melt(id_vars=["group"], value_vars=use_metrics, var_name="metric", value_name="value")
+
+    fig = px.bar(
+        melt_df,
+        x="group",
+        y="value",
+        color="metric",
+        barmode="group",
+        title=title
+    )
+    fig.update_layout(height=450, xaxis_tickangle=-35)
+    return fig
+
+def fig_compare_summary(df: pd.DataFrame, title: str, label_a: str, label_b: str):
+    if df is None or df.empty:
+        return None
+    melt_df = df.melt(
+        id_vars=["metric"],
+        value_vars=[label_a, label_b],
+        var_name="experiment",
+        value_name="value"
+    )
+    fig = px.bar(melt_df, x="metric", y="value", color="experiment", barmode="group", title=title)
+    fig.update_layout(height=420, xaxis_tickangle=-35)
+    return fig
+
+
+def fig_compare_group(df: pd.DataFrame, title: str, label_a: str, label_b: str):
+    if df is None or df.empty:
+        return None
+    melt_df = df.melt(
+        id_vars=["group"],
+        value_vars=[label_a, label_b],
+        var_name="experiment",
+        value_name="value"
+    )
+    fig = px.bar(melt_df, x="group", y="value", color="experiment", barmode="group", title=title)
+    fig.update_layout(height=450, xaxis_tickangle=-35)
+    return fig
+
+
+def render_json_block(data, title="查看 JSON", expanded=False):
+    with st.expander(title, expanded=expanded):
+        st.json(data)
+
+
+def load_cases_for_ui(source_mode, current_cases, path_text, uploaded_testset_file):
+    if source_mode == "当前会话测试集":
+        if not current_cases:
+            raise RuntimeError("当前会话中没有测试集，请先生成测试集")
+        return current_cases, "(session)"
+
+    if source_mode == "测试集路径":
+        if not path_text.strip():
+            raise RuntimeError("请填写测试集路径")
+        path = Path(path_text)
+        if not path.exists():
+            raise RuntimeError("测试集路径不存在")
+        return TestsetGenerator.load_jsonl(str(path)), str(path.resolve())
+
+    if source_mode == "上传测试集文件":
+        if uploaded_testset_file is None:
+            raise RuntimeError("请上传测试集文件")
+        tmp_path = save_uploaded_testset_file(uploaded_testset_file)
+        return TestsetGenerator.load_jsonl(str(tmp_path)), str(tmp_path.resolve())
+
+    raise RuntimeError("未知测试集来源模式")
+
+def build_report_in_ui(rag, cases, mode="all", top_k=5):
+    evaluator = RAGEvaluator(rag)
+
+    report = {
+        "meta": {
+            "created_at": now_str(),
+            "mode": mode,
+            "top_k": top_k,
+            "evaluated_count": len(cases)
+        },
+        "testset_stats": evaluator.summarize_testset(cases)
+    }
+
+    if mode in {"retrieval", "all"}:
+        retrieval_summary, retrieval_details = evaluator.evaluate_retrieval(cases, top_k=top_k)
+        retrieval_grouped = evaluator.build_retrieval_grouped_report(cases, retrieval_details, top_k=top_k)
+        report["retrieval"] = {
+            "summary": retrieval_summary,
+            "grouped": retrieval_grouped,
+            "details": retrieval_details
+        }
+
+    if mode in {"generation", "all"}:
+        generation_summary, generation_details = evaluator.evaluate_generation(cases, top_k=top_k)
+        generation_grouped = evaluator.build_generation_grouped_report(cases, generation_details)
+        report["generation"] = {
+            "summary": generation_summary,
+            "grouped": generation_grouped,
+            "details": generation_details
+        }
+
+    return report
+
+def extract_badcases(report: dict):
+    retrieval_bad = []
+    generation_bad = []
+    negative_bad = []
+
+    if "retrieval" in report:
+        for d in report["retrieval"]["details"]:
+            if not d.get("all_support_hit", False):
+                retrieval_bad.append({
+                    "case_id": d.get("case_id"),
+                    "case_type": d.get("case_type"),
+                    "question": d.get("question"),
+                    "source_group": d.get("source_group"),
+                    "gold_source_count": d.get("gold_source_count"),
+                    "matched_source_count": d.get("matched_source_count"),
+                    "support_coverage": d.get("support_coverage"),
+                    "first_support_rank": d.get("first_support_rank")
+                })
+
+    if "generation" in report:
+        for d in report["generation"]["details"]:
+            if d.get("expected_behavior") == "answer":
+                if d.get("answer_contain_hit", 0) == 0:
+                    generation_bad.append({
+                        "case_id": d.get("case_id"),
+                        "case_type": d.get("case_type"),
+                        "question": d.get("question"),
+                        "source_group": d.get("source_group"),
+                        "char_f1": d.get("char_f1"),
+                        "expected_answer": d.get("expected_answer"),
+                        "pred_answer": d.get("pred_answer")
+                    })
+            elif d.get("expected_behavior") == "refuse":
+                if d.get("refusal_ok", 0) == 0:
+                    negative_bad.append({
+                        "case_id": d.get("case_id"),
+                        "case_type": d.get("case_type"),
+                        "question": d.get("question"),
+                        "source_group": d.get("source_group"),
+                        "pred_answer": d.get("pred_answer")
+                    })
+
+    return retrieval_bad, generation_bad, negative_bad
+
+def make_summary_compare_df(summary_a: dict, summary_b: dict, label_a="A", label_b="B"):
+    metrics = sorted(set(summary_a.keys()) | set(summary_b.keys()))
+    rows = []
+    for m in metrics:
+        a = summary_a.get(m, None)
+        b = summary_b.get(m, None)
+        if not isinstance(a, (int, float)) and not isinstance(b, (int, float)):
+            continue
+
+        diff = None
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            diff = round(b - a, 6)
+
+        winner = ""
+        if "count" not in m and isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            if b > a:
+                winner = label_b
+            elif a > b:
+                winner = label_a
+            else:
+                winner = "tie"
+
+        rows.append({
+            "metric": m,
+            label_a: a,
+            label_b: b,
+            "diff(B-A)": diff,
+            "winner": winner
+        })
+    return pd.DataFrame(rows)
+
+
+def make_group_compare_df(grouped_a: dict, grouped_b: dict, metric: str, label_a="A", label_b="B", top_n=20):
+    keys = sorted(set(grouped_a.keys()) | set(grouped_b.keys()))
+    rows = []
+    for k in keys:
+        va = grouped_a.get(k, {})
+        vb = grouped_b.get(k, {})
+        a = va.get(metric, None)
+        b = vb.get(metric, None)
+        cnt = max(int(va.get("count", 0)), int(vb.get("count", 0)))
+        if a is None and b is None:
+            continue
+        diff = None
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            diff = round(b - a, 6)
+        rows.append({
+            "group": k,
+            "count": cnt,
+            label_a: a,
+            label_b: b,
+            "diff(B-A)": diff
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    if "count" in df.columns:
+        df = df.sort_values(["count", "group"], ascending=[False, True]).head(top_n)
+    return df
+
+def get_report_status_maps(report: dict):
+    out = {
+        "retrieval": {},
+        "generation_answer": {},
+        "generation_refuse": {},
+        "meta": {}
+    }
+
+    if "retrieval" in report:
+        for d in report["retrieval"]["details"]:
+            cid = d["case_id"]
+            out["retrieval"][cid] = bool(d.get("all_support_hit", False))
+            out["meta"][cid] = {
+                "case_id": cid,
+                "case_type": d.get("case_type"),
+                "question": d.get("question"),
+                "source_group": d.get("source_group")
+            }
+
+    if "generation" in report:
+        for d in report["generation"]["details"]:
+            cid = d["case_id"]
+            if d.get("expected_behavior") == "answer":
+                out["generation_answer"][cid] = bool(d.get("answer_contain_hit", 0))
+            else:
+                out["generation_refuse"][cid] = bool(d.get("refusal_ok", 0))
+
+            if cid not in out["meta"]:
+                out["meta"][cid] = {
+                    "case_id": cid,
+                    "case_type": d.get("case_type"),
+                    "question": d.get("question"),
+                    "source_group": d.get("source_group")
+                }
+
+    return out
+
+
+def build_diff_case_df(status_a: dict, status_b: dict, meta: dict, label_a="A", label_b="B"):
+    common_ids = set(status_a.keys()) & set(status_b.keys())
+
+    a_fail_b_pass = []
+    b_fail_a_pass = []
+
+    for cid in sorted(common_ids):
+        a_ok = bool(status_a.get(cid, False))
+        b_ok = bool(status_b.get(cid, False))
+        m = meta.get(cid, {})
+        row = {
+            "case_id": cid,
+            "case_type": m.get("case_type"),
+            "question": m.get("question"),
+            "source_group": m.get("source_group"),
+            label_a: a_ok,
+            label_b: b_ok
+        }
+        if (not a_ok) and b_ok:
+            a_fail_b_pass.append(row)
+        elif (not b_ok) and a_ok:
+            b_fail_a_pass.append(row)
+
+    return pd.DataFrame(a_fail_b_pass), pd.DataFrame(b_fail_a_pass)
+
+def build_rag_for_experiment(index_dir: str, vector_weight: float, bm25_weight: float):
+    if not index_dir.strip():
+        raise RuntimeError("索引目录不能为空")
+    path = Path(index_dir)
+    if not path.exists():
+        raise RuntimeError(f"索引目录不存在: {index_dir}")
+
+    rag = RAG()
+    rag.load_index(index_dir)
+    rag.store.vector_weight = float(vector_weight)
+    rag.store.bm25_weight = float(bm25_weight)
+    return rag
+
+
+def download_button_json(data, filename, label):
+    st.download_button(
+        label=label,
+        data=json.dumps(data, ensure_ascii=False, indent=2),
+        file_name=filename,
+        mime="application/json"
+    )
+
+
+def download_button_csv(df: pd.DataFrame, filename, label):
+    if df is None or df.empty:
+        st.info("无可下载数据")
+        return
+    st.download_button(
+        label=label,
+        data=df.to_csv(index=False).encode("utf-8-sig"),
+        file_name=filename,
+        mime="text/csv"
+    )
+
+_PLOTLY_SEQ = 0
+
+def show_plotly(fig, key_prefix: str):
+    global _PLOTLY_SEQ
+    if fig is None:
+        return
+    _PLOTLY_SEQ += 1
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        key=f"{key_prefix}_{_PLOTLY_SEQ}"
+        )
+
+# ============================================================
+# 页面标题
+# ============================================================
+st.title("🧠 RAG 测试与评估平台（完整版）")
+st.caption("支持索引持久化、图表可视化、文件上传、测试集生成、分组评估、A/B 对比实验")
+
+# ============================================================
+# 侧边栏
+# ============================================================
+with st.sidebar:
+    st.header("全局配置")
+
+    st.session_state.default_sources_text = st.text_area(
+        "知识源路径（每行一个）",
+        value=st.session_state.default_sources_text,
+        height=140
+    )
+
+    st.session_state.default_index_dir = st.text_input(
+        "默认索引目录",
+        value=st.session_state.default_index_dir
+    )
+
+    default_top_k = st.number_input(
+        "默认 Top K",
+        min_value=1,
+        #max_value=20,
+        value=5,
+        step=1
+    )
+
+    st.subheader("当前主实例检索权重")
+    st.session_state.main_vector_weight = st.number_input(
+        "向量权重",
+        min_value=0.0,
+        max_value=2.0,
+        value=float(st.session_state.main_vector_weight),
+        step=0.05
+    )
+    st.session_state.main_bm25_weight = st.number_input(
+        "BM25 权重",
+        min_value=0.0,
+        max_value=2.0,
+        value=float(st.session_state.main_bm25_weight),
+        step=0.05
+    )
+    if st.button("应用到当前主实例"):
+        try:
+            apply_main_weights()
+            st.success("权重已应用")
+        except Exception as e:
+            st.error(str(e))
+
+    st.caption("建议两个权重和为 1，但不是硬性要求。")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("初始化实例"):
+            reset_main_rag()
+            st.success("RAG 实例已初始化")
+    with c2:
+        if st.button("重置实例"):
+            reset_main_rag()
+            st.session_state.generated_cases = []
+            st.session_state.last_report = None
+            st.session_state.last_compare = None
+            st.session_state.qa_history = []
+            st.success("实例已重置")
+
+    st.divider()
+    st.subheader("当前状态")
+    try:
+        rag = get_main_rag()
+        stats = store_stats(rag)
+        st.metric("文档块数量", stats["chunk_count"])
+        st.metric("文档数量", stats["doc_count"])
+        st.metric("BM25词汇量", stats["bm25_vocab"])
+        #st.write("向量矩阵：", stats["vector_shape"])
+        st.write(f"向量矩阵：{stats['vector_shape']}")
+    except Exception as e:
+        st.error(f"状态读取失败: {e}")
+
+# ============================================================
+# Tabs
+# ============================================================
+tab_index, tab_qa, tab_testset, tab_eval, tab_compare = st.tabs(
+    ["📦 索引与上传", "💬 在线问答", "🧪 测试集生成", "📊 评估报表", "⚖️ 对比实验"]
+)
+
+# ============================================================
+# Tab 1: 索引与上传
+# ============================================================
+with tab_index:
+    st.subheader("索引管理 + 文件上传")
+
+    left, right = st.columns([1.05, 1.1])
+
+    with left:
+        st.markdown("### 文件上传工作区")
+
+        st.session_state.upload_root = st.text_input(
+            "上传根目录",
+            value=st.session_state.upload_root
+        )
+        st.session_state.upload_workspace = st.text_input(
+            "工作区名称",
+            value=st.session_state.upload_workspace
+        )
+
+        upload_workspace_dir = Path(st.session_state.upload_root).resolve() / st.session_state.upload_workspace
+        st.write(f"当前工作区：{upload_workspace_dir}")
+
+        uploaded_files = st.file_uploader(
+            "上传知识文件（支持多文件；若需要保留目录结构，建议上传 zip）",
+            type=SUPPORTED_UPLOAD_TYPES,
+            accept_multiple_files=True
+        )
+
+        unzip_archives = st.checkbox("上传 zip 时自动解压", value=True)
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            if st.button("保存上传文件", use_container_width=True):
+                if not uploaded_files:
+                    st.error("请先选择文件")
+                else:
+                    try:
+                        saved = save_uploaded_files(uploaded_files, upload_workspace_dir, unzip_archives=unzip_archives)
+                        st.success(f"已保存/解压 {len(saved)} 个文件")
+                    except Exception as e:
+                        st.error(f"保存失败: {e}")
+                        st.code(traceback.format_exc())
+
+]        with c2:
+            if st.button("将工作区追加到知识源", use_container_width=True):
+                current = parse_sources(st.session_state.default_sources_text)
+                ws = str(upload_workspace_dir)
+                if ws not in current:
+                    current.append(ws)
+                st.session_state.default_sources_text = "\n".join(current)
+                st.success("已追加到知识源列表")
+
+        with c3:
+            if st.button("仅使用当前工作区作为知识源", use_container_width=True):
+                st.session_state.default_sources_text = str(upload_workspace_dir)
+                st.success("已设置为唯一知识源")
+
+        st.markdown("### 工作区文件列表")
+        file_rows = list_files_recursive(upload_workspace_dir, limit=2000)
+        if file_rows:
+            file_df = pd.DataFrame(file_rows)
+            st.dataframe(file_df, use_container_width=True, height=320)
+            download_button_csv(file_df, "workspace_files.csv", "下载文件清单 CSV")
+        else:
+            st.info("当前工作区还没有文件")
+
+    with right:
+        st.markdown("### 索引操作")
+
+        sources = parse_sources(st.session_state.default_sources_text)
+        index_dir = st.session_state.default_index_dir
+
+        st.write("当前知识源数量：", len(sources))
+        if sources:
+            st.code("\n".join(sources), language="text")
+
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            if st.button("从知识源构建主索引", use_container_width=True):
+                if not sources:
+                    st.error("请先填写知识源路径或上传文件")
+                else:
+                    with st.spinner("正在构建索引，请稍候..."):
+                        try:
+                            rag = reset_main_rag()
+                            chunk_count = rag.load_knowledge(sources)
+                            sync_weight_inputs_from_rag(rag)
+                            st.success(f"索引构建完成，文档块数量: {chunk_count}")
+                        except Exception as e:
+                            st.error(f"构建失败: {e}")
+                            st.code(traceback.format_exc())
+
+        with cc2:
+            if st.button("从工作区直接构建主索引", use_container_width=True):
+                if not upload_workspace_dir.exists():
+                    st.error("工作区不存在，请先上传文件")
+                else:
+                    with st.spinner("正在从工作区构建索引..."):
+                        try:
+                            rag = reset_main_rag()
+                            chunk_count = rag.load_knowledge([str(upload_workspace_dir)])
+                            sync_weight_inputs_from_rag(rag)
+                            st.success(f"工作区索引构建完成，文档块数量: {chunk_count}")
+                        except Exception as e:
+                            st.error(f"构建失败: {e}")
+                            st.code(traceback.format_exc())
+
+        cc3, cc4 = st.columns(2)
+        with cc3:
+            if st.button("加载已有主索引", use_container_width=True):
+                if not index_dir:
+                    st.error("请先填写索引目录")
+                else:
+                    with st.spinner("正在加载索引..."):
+                        try:
+                            rag = reset_main_rag()
+                            rag.load_index(index_dir)
+                            sync_weight_inputs_from_rag(rag)
+                            st.success("索引加载成功")
+                        except Exception as e:
+                            st.error(f"加载失败: {e}")
+                            st.code(traceback.format_exc())
+
+        with cc4:
+            if st.button("保存当前主索引", use_container_width=True):
+                try:
+                    rag = get_main_rag()
+                    if len(rag.store) == 0:
+                        st.error("当前没有可保存的索引")
+                    else:
+                        rag.save_index(index_dir)
+                        st.success(f"索引已保存到: {index_dir}")
+                except Exception as e:
+                    st.error(f"保存失败: {e}")
+                    st.code(traceback.format_exc())
+
+        st.divider()
+
+        try:
+            rag = get_main_rag()
+            stats = store_stats(rag)
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("文档块数量", stats["chunk_count"])
+            c2.metric("文档数量", stats["doc_count"])
+            c3.metric("BM25词汇量", stats["bm25_vocab"])
+            #c4.write("向量矩阵", stats["vector_shape"])
+            with c4:
+                st.caption("向量矩阵")
+                st.code(str(stats["vector_shape"]))
+
+            top_docs_df = simple_dict_to_df(stats["top_docs"], key_name="filename", value_name="chunk_count")
+            if not top_docs_df.empty:
+                st.dataframe(top_docs_df, use_container_width=True, height=260)
+                fig = fig_bar(top_docs_df, "filename", "chunk_count", "文档块分布 Top 文档", top_n=50)
+                if fig:
+                    #st.plotly_chart(fig, use_container_width=True)
+                    show_plotly(fig, "index_top_docs")
+            else:
+                st.info("当前没有已加载文档")
+        except Exception as e:
+            st.error(f"统计展示失败: {e}")
+
+# ============================================================
+# Tab 2: 在线问答
+# ============================================================
+with tab_qa:
+    st.subheader("在线问答 / 检索可视化")
+
+    rag = get_main_rag()
+    if len(rag.store) == 0:
+        st.warning("当前知识库为空，请先在“索引与上传”里构建或加载索引。")
+    else:
+        qa_top_k = st.number_input("本次 Top K", min_value=1, max_value=50, value=int(default_top_k), step=1)
+        question = st.text_area("输入问题", height=120, placeholder="例如：某个流程在什么条件下需要切换到下一步？")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            ask_clicked = st.button("开始问答", use_container_width=True)
+        with c2:
+            search_clicked = st.button("仅检索", use_container_width=True)
+
+        if ask_clicked:
+            if not question.strip():
+                st.error("请输入问题")
+            else:
+                with st.spinner("正在检索并生成回答..."):
+                    try:
+                        answer, sources = rag.query(question, top_k=qa_top_k, verbose=False)
+
+                        st.session_state.qa_history.insert(0, {
+                            "time": now_str(),
+                            "question": question,
+                            "answer": answer
+                        })
+
+                        st.success("问答完成")
+                        st.markdown("### 🤖 回答")
+                        st.write(answer)
+
+                        st.markdown("### 📚 检索来源")
+                        if sources:
+                            score_rows = []
+                            for i, r in enumerate(sources, 1):
+                                score_rows.append({
+                                    "rank": i,
+                                    "filename": r.chunk.metadata.get("filename", "未知"),
+                                    "score": round(r.score, 4),
+                                    "vector_score": round(r.vector_score, 4),
+                                    "bm25_score": round(r.bm25_score, 4)
+                                })
+
+                            score_df = pd.DataFrame(score_rows)
+                            st.dataframe(score_df, use_container_width=True)
+
+                            melt_df = score_df.melt(
+                                id_vars=["rank", "filename"],
+                                value_vars=["score", "vector_score", "bm25_score"],
+                                var_name="metric",
+                                value_name="value"
+                            )
+                            fig = px.bar(
+                                melt_df,
+                                x="rank",
+                                y="value",
+                                color="metric",
+                                barmode="group",
+                                hover_data=["filename"],
+                                title="检索结果分数对比"
+                            )
+                            #st.plotly_chart(fig, use_container_width=True)
+                            show_plotly(fig, "qa_answer_scores")
+
+                            for i, r in enumerate(sources, 1):
+                                with st.expander(
+                                    f"[{i}] {r.chunk.metadata.get('filename', '未知')} | 综合={r.score:.4f} | V={r.vector_score:.4f} | B={r.bm25_score:.4f}",
+                                    expanded=(i == 1)
+                                ):
+                                    #st.write("章节：", r.chunk.header_context or "(无)")
+                                    st.write(f"章节：{r.chunk.header_context or '(无)'}")
+                                    st.write(r.chunk.content)
+                        else:
+                            st.info("无检索结果")
+                    except Exception as e:
+                        st.error(f"问答失败: {e}")
+                        st.code(traceback.format_exc())
+
+        if search_clicked:
+            if not question.strip():
+                st.error("请输入问题")
+            else:
+                with st.spinner("正在检索..."):
+                    try:
+                        results = rag.retrieve(question, top_k=qa_top_k, verbose=False)
+                        st.success(f"共返回 {len(results)} 个结果")
+
+                        rows = []
+                        for i, r in enumerate(results, 1):
+                            rows.append({
+                                "rank": i,
+                                "filename": r.chunk.metadata.get("filename", "未知"),
+                                "score": round(r.score, 4),
+                                "vector_score": round(r.vector_score, 4),
+                                "bm25_score": round(r.bm25_score, 4),
+                                "header": (r.chunk.header_context.splitlines()[0] if r.chunk.header_context else ""),
+                                "content_preview": r.chunk.content[:150]
+                            })
+                        df = pd.DataFrame(rows)
+                        st.dataframe(df, use_container_width=True)
+
+                        if not df.empty:
+                            melt_df = df.melt(
+                                id_vars=["rank", "filename"],
+                                value_vars=["score", "vector_score", "bm25_score"],
+                                var_name="metric",
+                                value_name="value"
+                            )
+                            fig = px.bar(
+                                melt_df,
+                                x="rank",
+                                y="value",
+                                color="metric",
+                                barmode="group",
+                                hover_data=["filename"],
+                                title="检索分数可视化"
+                            )
+                            #st.plotly_chart(fig, use_container_width=True)
+                            show_plotly(fig, "qa_search_scores")
+
+                        for i, r in enumerate(results, 1):
+                            with st.expander(f"[{i}] {r.chunk.metadata.get('filename', '未知')}"):
+                                #st.write("章节：", r.chunk.header_context or "(无)")
+                                st.write(f"章节：{r.chunk.header_context or '(无)'}")
+                                st.write(r.chunk.content)
+                    except Exception as e:
+                        st.error(f"检索失败: {e}")
+                        st.code(traceback.format_exc())
+
+        st.divider()
+        st.subheader("最近问答历史")
+        if not st.session_state.qa_history:
+            st.info("暂无历史")
+        else:
+            for i, item in enumerate(st.session_state.qa_history[:10], 1):
+                with st.expander(f"{i}. [{item['time']}] {item['question'][:80]}"):
+                    st.markdown("**问题**")
+                    st.write(item["question"])
+                    st.markdown("**回答**")
+                    st.write(item["answer"])
+
+# ============================================================
+# Tab 3: 测试集生成
+# ============================================================
+with tab_testset:
+    st.subheader("测试集生成（含高级题型）")
+
+    rag = get_main_rag()
+    if len(rag.store) == 0:
+        st.warning("当前知识库为空，请先构建或加载索引。")
+    else:
+        st.session_state.default_testset_path = st.text_input(
+            "测试集输出路径",
+            value=st.session_state.default_testset_path
+        )
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            max_positive = st.number_input("普通题", min_value=0, max_value=500, value=40, step=1)
+            max_disamb = st.number_input("消歧题", min_value=0, max_value=500, value=15, step=1)
+            max_negative = st.number_input("负样本拒答题", min_value=0, max_value=500, value=20, step=1)
+
+        with col2:
+            max_doc_synth = st.number_input("同文档综合题", min_value=0, max_value=500, value=10, step=1)
+            max_cross_doc = st.number_input("跨文档综合题", min_value=0, max_value=500, value=10, step=1)
+            max_semantic = st.number_input("语义改写题", min_value=0, max_value=500, value=10, step=1)
+
+        with col3:
+            max_reasoning = st.number_input("推理题", min_value=0, max_value=500, value=10, step=1)
+            max_multihop = st.number_input("多跳题", min_value=0, max_value=500, value=10, step=1)
+            max_semiconductor = st.number_input("半导体术语别名题", min_value=0, max_value=500, value=10, step=1)
+
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            seed = st.number_input("随机种子", min_value=0, max_value=999999, value=42, step=1)
+        with cc2:
+            min_chars = st.number_input("最小 chunk 长度", min_value=20, max_value=5000, value=120, step=10)
+
+        if st.button("生成测试集", use_container_width=True):
+            with st.spinner("正在生成测试集，这一步可能比较慢..."):
+                try:
+                    generator = TestsetGenerator(rag.llm, rag.store)
+                    cases = generator.generate_from_chunks(
+                        rag.store.chunks,
+                        max_positive=max_positive,
+                        max_disamb=max_disamb,
+                        max_negative=max_negative,
+                        max_doc_synth=max_doc_synth,
+                        max_cross_doc=max_cross_doc,
+                        max_semantic=max_semantic,
+                        max_reasoning=max_reasoning,
+                        max_multihop=max_multihop,
+                        max_semiconductor=max_semiconductor,
+                        seed=seed,
+                        min_chunk_chars=min_chars
+                    )
+                    st.session_state.generated_cases = cases
+
+                    if st.session_state.default_testset_path.strip():
+                        generator.save_jsonl(cases, st.session_state.default_testset_path)
+
+                    st.success(f"测试集生成完成，共 {len(cases)} 条")
+                except Exception as e:
+                    st.error(f"生成失败: {e}")
+                    st.code(traceback.format_exc())
+
+        st.divider()
+
+        cases = st.session_state.generated_cases
+        if cases:
+            st.subheader("测试集可视化概览")
+
+            preview_df = testcases_to_df(cases, limit=1000)
+            if not preview_df.empty:
+                type_counter = Counter(preview_df["case_type"])
+                type_df = simple_dict_to_df(dict(type_counter), "case_type", "count")
+
+                behavior_counter = Counter(preview_df["expected_behavior"])
+                behavior_df = simple_dict_to_df(dict(behavior_counter), "expected_behavior", "count")
+
+                diff_counter = Counter(preview_df["difficulty"])
+                diff_df = simple_dict_to_df(dict(diff_counter), "difficulty", "count")
+
+                chart1, chart2, chart3 = st.columns(3)
+                with chart1:
+                    fig = fig_bar(type_df, "case_type", "count", "题型分布", top_n=30)
+                    if fig:
+                        #st.plotly_chart(fig, use_container_width=True)
+                        show_plotly(fig, "testset_case_type")
+                with chart2:
+                    fig = fig_pie(behavior_df, "expected_behavior", "count", "回答/拒答分布")
+                    if fig:
+                        #st.plotly_chart(fig, use_container_width=True)
+                        show_plotly(fig, "testset_behavior")
+                with chart3:
+                    fig = fig_bar(diff_df, "difficulty", "count", "难度分布")
+                    if fig:
+                        #st.plotly_chart(fig, use_container_width=True)
+                        show_plotly(fig, "testset_difficulty")
+
+                st.subheader("测试集样本表")
+                filter_case_type = st.selectbox(
+                    "按题型过滤",
+                    options=["(全部)"] + sorted(preview_df["case_type"].dropna().unique().tolist())
+                )
+                view_df = preview_df.copy()
+                if filter_case_type != "(全部)":
+                    view_df = view_df[view_df["case_type"] == filter_case_type]
+
+                st.dataframe(view_df, use_container_width=True, height=360)
+
+                if st.session_state.default_testset_path.strip():
+                    st.info(f"当前测试集已保存到：{st.session_state.default_testset_path}")
+
+                jsonl_str = cases_to_jsonl_string(cases)
+                st.download_button(
+                    "下载当前测试集 JSONL",
+                    data=jsonl_str.encode("utf-8"),
+                    file_name="testset.jsonl",
+                    mime="application/json"
+                )
+
+                with st.expander("查看前 5 条样本 JSON"):
+                    st.json([asdict(c) for c in cases[:5]])
+            else:
+                st.info("暂无测试集数据")
+        else:
+            st.info("尚未生成测试集")
+
+# ============================================================
+# Tab 4: 评估报表
+# ============================================================
+with tab_eval:
+    st.subheader("评估报表 + 图表可视化")
+
+    rag = get_main_rag()
+    if len(rag.store) == 0:
+        st.warning("当前知识库为空，请先构建或加载索引。")
+    else:
+        source_mode = st.radio(
+            "测试集来源",
+            ["当前会话测试集", "测试集路径", "上传测试集文件"],
+            horizontal=True
+        )
+
+        uploaded_testset_file = None
+        if source_mode == "测试集路径":
+            testset_path = st.text_input("测试集路径", value=st.session_state.default_testset_path)
+        elif source_mode == "上传测试集文件":
+            uploaded_testset_file = st.file_uploader("上传测试集 JSONL", type=["jsonl", "txt", "json"])
+            testset_path = ""
+        else:
+            testset_path = st.session_state.default_testset_path
+
+        st.session_state.default_report_path = st.text_input(
+            "报告输出路径（可选）",
+            value=st.session_state.default_report_path
+        )
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            eval_mode = st.selectbox("评估模式", ["all", "retrieval", "generation"], index=0)
+        with c2:
+            eval_top_k = st.number_input("评估 Top K", min_value=1, max_value=20, value=int(default_top_k), step=1)
+        with c3:
+            limit = st.number_input("仅评估前 N 条（0=全部）", min_value=0, max_value=100000, value=0, step=1)
+
+        if st.button("开始评估", use_container_width=True):
+            with st.spinner("正在评估，这一步可能较慢..."):
+                try:
+                    cases, actual_case_source = load_cases_for_ui(
+                        source_mode=source_mode,
+                        current_cases=st.session_state.generated_cases,
+                        path_text=testset_path,
+                        uploaded_testset_file=uploaded_testset_file
+                    )
+                    if limit > 0:
+                        cases = cases[:limit]
+
+                    report = build_report_in_ui(
+                        rag=rag,
+                        cases=cases,
+                        mode=eval_mode,
+                        top_k=eval_top_k
+                    )
+                    report["meta"]["testset_source"] = actual_case_source
+                    report["meta"]["index_dir"] = st.session_state.default_index_dir
+                    st.session_state.last_report = report
+
+                    if st.session_state.default_report_path.strip():
+                        with open(st.session_state.default_report_path, "w", encoding="utf-8") as f:
+                            json.dump(report, f, ensure_ascii=False, indent=2)
+
+                    st.success("评估完成")
+                except Exception as e:
+                    st.error(f"评估失败: {e}")
+                    st.code(traceback.format_exc())
+
+        st.divider()
+
+        report = st.session_state.last_report
+        if report:
+            st.markdown("## 测试集统计")
+            show_metrics_from_summary({
+                "count": report["testset_stats"].get("count", 0),
+                "multi_source_case_count": report["testset_stats"].get("multi_source_case_count", 0)
+            })
+
+            stats_tab1, stats_tab2 = st.tabs(["统计图表", "原始统计 JSON"])
+            with stats_tab1:
+                t1, t2, t3 = st.columns(3)
+
+                by_case_type_df = simple_dict_to_df(report["testset_stats"].get("by_case_type", {}), "case_type", "count")
+                by_behavior_df = simple_dict_to_df(report["testset_stats"].get("by_expected_behavior", {}), "expected_behavior", "count")
+                by_tags_df = simple_dict_to_df(report["testset_stats"].get("top_tags", {}), "tag", "count")
+
+                with t1:
+                    fig = fig_bar(by_case_type_df, "case_type", "count", "测试集题型分布", top_n=30)
+                    if fig:
+                        #st.plotly_chart(fig, use_container_width=True)
+                        show_plotly(fig, "eval_testset_case_type")
+                with t2:
+                    fig = fig_pie(by_behavior_df, "expected_behavior", "count", "回答/拒答分布")
+                    if fig:
+                        #st.plotly_chart(fig, use_container_width=True)
+                        show_plotly(fig, "eval_testset_behavior")
+                with t3:
+                    fig = fig_bar(by_tags_df, "tag", "count", "标签分布 Top 20", top_n=20)
+                    if fig:
+                        #st.plotly_chart(fig, use_container_width=True)
+                        show_plotly(fig, "eval_testset_tags")
+
+            with stats_tab2:
+                render_json_block(report["testset_stats"], "查看 testset_stats", expanded=True)
+
+            if "retrieval" in report:
+                st.markdown("## 检索评估")
+                show_metrics_from_summary(report["retrieval"]["summary"])
+
+                rt1, rt2 = st.tabs(["图表", "表格"])
+                with rt1:
+                    grouped = report["retrieval"]["grouped"]
+
+                    fig = fig_multi_metric(
+                        grouped.get("by_case_type", {}),
+                        "按题型的检索表现",
+                        metrics=[
+                            f"all_support_hit_rate@{report['meta']['top_k']}",
+                            f"any_support_hit_rate@{report['meta']['top_k']}",
+                            f"avg_support_coverage@{report['meta']['top_k']}",
+                            f"mrr_first_support@{report['meta']['top_k']}"
+                        ],
+                        top_n=20
+                    )
+                    if fig:
+                        #st.plotly_chart(fig, use_container_width=True)
+                        show_plotly(fig, "eval_retrieval_case_type")
+
+                    fig = fig_multi_metric(
+                        grouped.get("by_source_doc", {}),
+                        "按文档的检索表现 Top 15",
+                        metrics=[
+                            f"all_support_hit_rate@{report['meta']['top_k']}",
+                            f"avg_support_coverage@{report['meta']['top_k']}"
+                        ],
+                        top_n=15
+                    )
+                    if fig:
+                        #st.plotly_chart(fig, use_container_width=True)
+                        show_plotly(fig, "eval_retrieval_source_doc")
+
+                with rt2:
+                    g1, g2, g3 = st.tabs(["by_case_type", "by_source_doc", "by_source_header"])
+                    with g1:
+                        st.dataframe(grouped_dict_to_df(report["retrieval"]["grouped"]["by_case_type"]), use_container_width=True)
+                    with g2:
+                        st.dataframe(grouped_dict_to_df(report["retrieval"]["grouped"]["by_source_doc"]), use_container_width=True)
+                    with g3:
+                        st.dataframe(grouped_dict_to_df(report["retrieval"]["grouped"]["by_source_header"]), use_container_width=True, height=360)
+
+            if "generation" in report:
+                st.markdown("## 回答评估")
+                show_metrics_from_summary(report["generation"]["summary"])
+
+                gt1, gt2 = st.tabs(["图表", "表格"])
+                with gt1:
+                    grouped = report["generation"]["grouped"]
+
+                    fig = fig_multi_metric(
+                        grouped.get("answerable_by_case_type", {}),
+                        "按题型的回答表现",
+                        metrics=["answer_contain_rate", "avg_char_f1"],
+                        top_n=20
+                    )
+                    if fig:
+                        #st.plotly_chart(fig, use_container_width=True)
+                        show_plotly(fig, "eval_generation_case_type")
+
+                    fig = fig_multi_metric(
+                        grouped.get("answerable_by_source_doc", {}),
+                        "按文档的回答表现 Top 15",
+                        metrics=["answer_contain_rate", "avg_char_f1"],
+                        top_n=15
+                    )
+                    if fig:
+                        #st.plotly_chart(fig, use_container_width=True)
+                        show_plotly(fig, "eval_generation_source_doc")
+
+                    neg_df = grouped_dict_to_df(grouped.get("negative_by_origin_doc", {}))
+                    if not neg_df.empty and "negative_refusal_rate" in neg_df.columns:
+                        fig = fig_bar(
+                            neg_df,
+                            "group",
+                            "negative_refusal_rate",
+                            "负样本拒答率（按来源文档）Top 15",
+                            top_n=15,
+                            sort_by="count",
+                            ascending=False
+                        )
+                        if fig:
+                            #st.plotly_chart(fig, use_container_width=True)
+                            show_plotly(fig, "eval_generation_negative_origin")
+
+                with gt2:
+                    g1, g2, g3, g4, g5 = st.tabs([
+                        "answerable_by_case_type",
+                        "answerable_by_source_doc",
+                        "answerable_by_source_header",
+                        "negative_by_case_type",
+                        "negative_by_origin_doc"
+                    ])
+                    with g1:
+                        st.dataframe(grouped_dict_to_df(report["generation"]["grouped"]["answerable_by_case_type"]), use_container_width=True)
+                    with g2:
+                        st.dataframe(grouped_dict_to_df(report["generation"]["grouped"]["answerable_by_source_doc"]), use_container_width=True)
+                    with g3:
+                        st.dataframe(grouped_dict_to_df(report["generation"]["grouped"]["answerable_by_source_header"]), use_container_width=True, height=360)
+                    with g4:
+                        st.dataframe(grouped_dict_to_df(report["generation"]["grouped"]["negative_by_case_type"]), use_container_width=True)
+                    with g5:
+                        st.dataframe(grouped_dict_to_df(report["generation"]["grouped"]["negative_by_origin_doc"]), use_container_width=True)
+
+            st.markdown("## Bad Cases")
+            retrieval_bad, generation_bad, negative_bad = extract_badcases(report)
+
+            b1, b2, b3 = st.tabs(["检索失败", "回答失败", "拒答失败"])
+            with b1:
+                bad_df = pd.DataFrame(retrieval_bad)
+                if bad_df.empty:
+                    st.success("没有检索失败 bad cases")
+                else:
+                    st.dataframe(bad_df, use_container_width=True)
+                    fig = fig_bar(
+                        bad_df.groupby("case_type").size().reset_index(name="count"),
+                        "case_type",
+                        "count",
+                        "检索失败按题型分布"
+                    )
+                    if fig:
+                        #st.plotly_chart(fig, use_container_width=True)
+                        show_plotly(fig, "bad_retrieval_case_type")
+                    download_button_csv(bad_df, "badcases_retrieval.csv", "下载检索失败 CSV")
+
+            with b2:
+                bad_df = pd.DataFrame(generation_bad)
+                if bad_df.empty:
+                    st.success("没有回答失败 bad cases")
+                else:
+                    st.dataframe(bad_df, use_container_width=True)
+                    fig = fig_bar(
+                        bad_df.groupby("case_type").size().reset_index(name="count"),
+                        "case_type",
+                        "count",
+                        "回答失败按题型分布"
+                    )
+                    if fig:
+                        #st.plotly_chart(fig, use_container_width=True)
+                        show_plotly(fig, "bad_generation_case_type")
+                    download_button_csv(bad_df, "badcases_generation.csv", "下载回答失败 CSV")
+
+            with b3:
+                bad_df = pd.DataFrame(negative_bad)
+                if bad_df.empty:
+                    st.success("没有拒答失败 bad cases")
+                else:
+                    st.dataframe(bad_df, use_container_width=True)
+                    fig = fig_bar(
+                        bad_df.groupby("case_type").size().reset_index(name="count"),
+                        "case_type",
+                        "count",
+                        "拒答失败按题型分布"
+                    )
+                    if fig:
+                        #st.plotly_chart(fig, use_container_width=True)
+                        show_plotly(fig, "bad_refusal_case_type")
+                    download_button_csv(bad_df, "badcases_refusal.csv", "下载拒答失败 CSV")
+
+            st.markdown("## 下载与原始报告")
+            download_button_json(report, "rag_eval_report.json", "下载当前报告 JSON")
+            render_json_block(report, "查看完整评估报告 JSON")
+        else:
+            st.info("尚未运行评估")
+
+# ============================================================
+# Tab 5: 对比实验
+# ============================================================
+with tab_compare:
+    st.subheader("A/B 对比实验")
+
+    st.info("建议先保存好两个索引目录，然后在这里对比不同索引或不同检索权重。")
+
+    source_mode = st.radio(
+        "对比实验使用的测试集来源",
+        ["当前会话测试集", "测试集路径", "上传测试集文件"],
+        horizontal=True,
+        key="compare_source_mode"
+    )
+
+    compare_uploaded_testset = None
+    if source_mode == "测试集路径":
+        compare_testset_path = st.text_input("测试集路径", value=st.session_state.default_testset_path, key="compare_testset_path")
+    elif source_mode == "上传测试集文件":
+        compare_uploaded_testset = st.file_uploader("上传测试集 JSONL", type=["jsonl", "txt", "json"], key="compare_testset_upload")
+        compare_testset_path = ""
+    else:
+        compare_testset_path = st.session_state.default_testset_path
+
+    g1, g2, g3 = st.columns(3)
+    with g1:
+        compare_mode = st.selectbox("对比模式", ["retrieval", "generation", "all"], index=0)
+    with g2:
+        compare_top_k = st.number_input("对比 Top K", min_value=1, max_value=20, value=int(default_top_k), step=1, key="compare_top_k")
+    with g3:
+        compare_limit = st.number_input("只对比前 N 条（0=全部）", min_value=0, max_value=100000, value=0, step=1, key="compare_limit")
+
+    left, right = st.columns(2)
+
+    with left:
+        st.markdown("### 实验 A")
+        exp_a_label = st.text_input("A 标签", value="Experiment A")
+        exp_a_index = st.text_input("A 索引目录", value=st.session_state.default_index_dir)
+        exp_a_v = st.number_input("A 向量权重", min_value=0.0, max_value=2.0, value=0.6, step=0.05, key="exp_a_v")
+        exp_a_b = st.number_input("A BM25 权重", min_value=0.0, max_value=2.0, value=0.4, step=0.05, key="exp_a_b")
+
+    with right:
+        st.markdown("### 实验 B")
+        exp_b_label = st.text_input("B 标签", value="Experiment B")
+        exp_b_index = st.text_input("B 索引目录", value=st.session_state.default_index_dir)
+        exp_b_v = st.number_input("B 向量权重", min_value=0.0, max_value=2.0, value=0.5, step=0.05, key="exp_b_v")
+        exp_b_b = st.number_input("B BM25 权重", min_value=0.0, max_value=2.0, value=0.5, step=0.05, key="exp_b_b")
+
+    if st.button("开始 A/B 对比", use_container_width=True):
+        with st.spinner("正在运行 A/B 对比，这一步可能较慢..."):
+            try:
+                cases, actual_case_source = load_cases_for_ui(
+                    source_mode=source_mode,
+                    current_cases=st.session_state.generated_cases,
+                    path_text=compare_testset_path,
+                    uploaded_testset_file=compare_uploaded_testset
+                )
+                if compare_limit > 0:
+                    cases = cases[:compare_limit]
+
+                rag_a = build_rag_for_experiment(exp_a_index, exp_a_v, exp_a_b)
+                rag_b = build_rag_for_experiment(exp_b_index, exp_b_v, exp_b_b)
+
+                report_a = build_report_in_ui(rag_a, cases, mode=compare_mode, top_k=compare_top_k)
+                report_b = build_report_in_ui(rag_b, cases, mode=compare_mode, top_k=compare_top_k)
+
+                st.session_state.last_compare = {
+                    "meta": {
+                        "created_at": now_str(),
+                        "testset_source": actual_case_source,
+                        "mode": compare_mode,
+                        "top_k": compare_top_k,
+                        "evaluated_count": len(cases)
+                    },
+                    "A": {
+                        "label": exp_a_label,
+                        "index_dir": exp_a_index,
+                        "vector_weight": exp_a_v,
+                        "bm25_weight": exp_a_b,
+                        "report": report_a
+                    },
+                    "B": {
+                        "label": exp_b_label,
+                        "index_dir": exp_b_index,
+                        "vector_weight": exp_b_v,
+                        "bm25_weight": exp_b_b,
+                        "report": report_b
+                    }
+                }
+
+                st.success("A/B 对比完成")
+            except Exception as e:
+                st.error(f"A/B 对比失败: {e}")
+                st.code(traceback.format_exc())
+
+    st.divider()
+
+    compare_result = st.session_state.last_compare
+    if compare_result:
+        label_a = compare_result["A"]["label"]
+        label_b = compare_result["B"]["label"]
+        report_a = compare_result["A"]["report"]
+        report_b = compare_result["B"]["report"]
+
+        st.markdown("## 实验配置")
+        cfg_df = pd.DataFrame([
+            {
+                "experiment": label_a,
+                "index_dir": compare_result["A"]["index_dir"],
+                "vector_weight": compare_result["A"]["vector_weight"],
+                "bm25_weight": compare_result["A"]["bm25_weight"]
+            },
+            {
+                "experiment": label_b,
+                "index_dir": compare_result["B"]["index_dir"],
+                "vector_weight": compare_result["B"]["vector_weight"],
+                "bm25_weight": compare_result["B"]["bm25_weight"]
+            }
+        ])
+        st.dataframe(cfg_df, use_container_width=True)
+
+        # Summary compare
+        if "retrieval" in report_a and "retrieval" in report_b:
+            st.markdown("## 检索 Summary 对比")
+            cmp_df = make_summary_compare_df(
+                report_a["retrieval"]["summary"],
+                report_b["retrieval"]["summary"],
+                label_a=label_a,
+                label_b=label_b
+            )
+            st.dataframe(cmp_df, use_container_width=True)
+            fig = fig_compare_summary(cmp_df, "检索 Summary 对比", label_a, label_b)
+            if fig:
+                #st.plotly_chart(fig, use_container_width=True)
+                show_plotly(fig, "compare_retrieval_summary")
+
+        if "generation" in report_a and "generation" in report_b:
+            st.markdown("## 回答 Summary 对比")
+            cmp_df = make_summary_compare_df(
+                report_a["generation"]["summary"],
+                report_b["generation"]["summary"],
+                label_a=label_a,
+                label_b=label_b
+            )
+            st.dataframe(cmp_df, use_container_width=True)
+            fig = fig_compare_summary(cmp_df, "回答 Summary 对比", label_a, label_b)
+            if fig:
+                #st.plotly_chart(fig, use_container_width=True)
+                show_plotly(fig, "compare_generation_summary")
+
+        # Group compare
+        st.markdown("## 分组指标对比")
+        compare_tabs = st.tabs(["检索分组对比", "回答分组对比"])
+
+        with compare_tabs[0]:
+            if "retrieval" in report_a and "retrieval" in report_b:
+                retrieval_group_key = st.selectbox(
+                    "检索分组维度",
+                    options=list(report_a["retrieval"]["grouped"].keys()),
+                    key="retrieval_group_key_compare"
+                )
+                possible_metrics = []
+                tmp_df = grouped_dict_to_df(report_a["retrieval"]["grouped"][retrieval_group_key])
+                for col in tmp_df.columns:
+                    if col != "group" and col != "count":
+                        possible_metrics.append(col)
+
+                if possible_metrics:
+                    metric = st.selectbox("检索分组指标", possible_metrics, key="retrieval_metric_compare")
+                    group_cmp_df = make_group_compare_df(
+                        report_a["retrieval"]["grouped"][retrieval_group_key],
+                        report_b["retrieval"]["grouped"][retrieval_group_key],
+                        metric=metric,
+                        label_a=label_a,
+                        label_b=label_b,
+                        top_n=20
+                    )
+                    st.dataframe(group_cmp_df, use_container_width=True)
+                    fig = fig_compare_group(group_cmp_df, f"检索分组对比：{metric}", label_a, label_b)
+                    if fig:
+                        #st.plotly_chart(fig, use_container_width=True)
+                        show_plotly(fig, "compare_retrieval_group")
+                else:
+                    st.info("该检索分组暂无可对比指标")
+            else:
+                st.info("当前对比结果不包含检索结果")
+
+        with compare_tabs[1]:
+            if "generation" in report_a and "generation" in report_b:
+                generation_group_key = st.selectbox(
+                    "回答分组维度",
+                    options=list(report_a["generation"]["grouped"].keys()),
+                    key="generation_group_key_compare"
+                )
+                possible_metrics = []
+                tmp_df = grouped_dict_to_df(report_a["generation"]["grouped"][generation_group_key])
+                for col in tmp_df.columns:
+                    if col != "group" and col != "count":
+                        possible_metrics.append(col)
+
+                if possible_metrics:
+                    metric = st.selectbox("回答分组指标", possible_metrics, key="generation_metric_compare")
+                    group_cmp_df = make_group_compare_df(
+                        report_a["generation"]["grouped"][generation_group_key],
+                        report_b["generation"]["grouped"][generation_group_key],
+                        metric=metric,
+                        label_a=label_a,
+                        label_b=label_b,
+                        top_n=20
+                    )
+                    st.dataframe(group_cmp_df, use_container_width=True)
+                    fig = fig_compare_group(group_cmp_df, f"回答分组对比：{metric}", label_a, label_b)
+                    if fig:
+                        #st.plotly_chart(fig, use_container_width=True)
+                        show_plotly(fig, "compare_generation_group")
+                else:
+                    st.info("该回答分组暂无可对比指标")
+            else:
+                st.info("当前对比结果不包含回答结果")
+
+        # Differential badcases
+        st.markdown("## 差异样本（谁失败但对方成功）")
+        maps_a = get_report_status_maps(report_a)
+        maps_b = get_report_status_maps(report_b)
+
+        diff_tabs = st.tabs(["检索差异", "回答差异", "拒答差异"])
+
+        with diff_tabs[0]:
+            a_fail_b_pass_df, b_fail_a_pass_df = build_diff_case_df(
+                maps_a["retrieval"],
+                maps_b["retrieval"],
+                maps_a["meta"] | maps_b["meta"],
+                label_a=label_a,
+                label_b=label_b
+            )
+            c1, c2 = st.columns(2)
+            with c1:
+                st.metric(f"{label_a} 失败 / {label_b} 成功", len(a_fail_b_pass_df))
+                if not a_fail_b_pass_df.empty:
+                    st.dataframe(a_fail_b_pass_df, use_container_width=True, height=260)
+                    download_button_csv(a_fail_b_pass_df, "retrieval_A_fail_B_pass.csv", f"下载 {label_a}失败_{label_b}成功 CSV")
+            with c2:
+                st.metric(f"{label_b} 失败 / {label_a} 成功", len(b_fail_a_pass_df))
+                if not b_fail_a_pass_df.empty:
+                    st.dataframe(b_fail_a_pass_df, use_container_width=True, height=260)
+                    download_button_csv(b_fail_a_pass_df, "retrieval_B_fail_A_pass.csv", f"下载 {label_b}失败_{label_a}成功 CSV")
+
+        with diff_tabs[1]:
+            a_fail_b_pass_df, b_fail_a_pass_df = build_diff_case_df(
+                maps_a["generation_answer"],
+                maps_b["generation_answer"],
+                maps_a["meta"] | maps_b["meta"],
+                label_a=label_a,
+                label_b=label_b
+            )
+            c1, c2 = st.columns(2)
+            with c1:
+                st.metric(f"{label_a} 回答失败 / {label_b} 成功", len(a_fail_b_pass_df))
+                if not a_fail_b_pass_df.empty:
+                    st.dataframe(a_fail_b_pass_df, use_container_width=True, height=260)
+                    download_button_csv(a_fail_b_pass_df, "generation_A_fail_B_pass.csv", f"下载 {label_a}回答失败_{label_b}成功 CSV")
+            with c2:
+                st.metric(f"{label_b} 回答失败 / {label_a} 成功", len(b_fail_a_pass_df))
+                if not b_fail_a_pass_df.empty:
+                    st.dataframe(b_fail_a_pass_df, use_container_width=True, height=260)
+                    download_button_csv(b_fail_a_pass_df, "generation_B_fail_A_pass.csv", f"下载 {label_b}回答失败_{label_a}成功 CSV")
+
+        with diff_tabs[2]:
+            a_fail_b_pass_df, b_fail_a_pass_df = build_diff_case_df(
+                maps_a["generation_refuse"],
+                maps_b["generation_refuse"],
+                maps_a["meta"] | maps_b["meta"],
+                label_a=label_a,
+                label_b=label_b
+            )
+            c1, c2 = st.columns(2)
+            with c1:
+                st.metric(f"{label_a} 拒答失败 / {label_b} 成功", len(a_fail_b_pass_df))
+                if not a_fail_b_pass_df.empty:
+                    st.dataframe(a_fail_b_pass_df, use_container_width=True, height=260)
+                    download_button_csv(a_fail_b_pass_df, "refusal_A_fail_B_pass.csv", f"下载 {label_a}拒答失败_{label_b}成功 CSV")
+            with c2:
+                st.metric(f"{label_b} 拒答失败 / {label_a} 成功", len(b_fail_a_pass_df))
+                if not b_fail_a_pass_df.empty:
+                    st.dataframe(b_fail_a_pass_df, use_container_width=True, height=260)
+                    download_button_csv(b_fail_a_pass_df, "refusal_B_fail_A_pass.csv", f"下载 {label_b}拒答失败_{label_a}成功 CSV")
+
+        st.markdown("## 下载对比结果")
+        download_button_json(compare_result, "ab_compare_report.json", "下载 A/B 对比报告 JSON")
+        render_json_block(compare_result, "查看完整 A/B 对比报告 JSON")
+    else:
+        st.info("尚未运行对比实验")
