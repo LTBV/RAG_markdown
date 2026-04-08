@@ -257,6 +257,54 @@ def format_chunk_attrs(metadata: Dict, max_items: int = 12, max_len: int = 240) 
     front = metadata.get("front_matter") or {}
     return format_front_matter_text(front, max_items=max_items, max_len=max_len)
 
+def front_matter_json_text(metadata: Dict, max_len: int = 1200) -> str:
+    """把 front matter 转成更适合喂给 LLM 的 JSON 文本"""
+    if not metadata:
+        return ""
+    front = metadata.get("front_matter") or {}
+    if not front:
+        return ""
+    try:
+        text = json.dumps(front, ensure_ascii=False, indent=2)
+    except Exception:
+        text = str(front)
+    if len(text) > max_len:
+        text = text[:max_len - 3] + "..."
+    return text
+
+
+def build_result_front_matter_summary(results, max_docs: int = 3, max_len: int = 220) -> str:
+    """
+    从检索结果里提取去重后的 front matter 摘要，
+    用于在最终回答后做“检索补充属性”展示
+    """
+    lines = []
+    seen = set()
+
+    for r in results:
+        source_key = (
+            r.chunk.metadata.get("source")
+            or r.chunk.metadata.get("filename")
+            or r.chunk.doc_id
+        )
+        if source_key in seen:
+            continue
+        seen.add(source_key)
+
+        front = r.chunk.metadata.get("front_matter") or {}
+        if not front:
+            continue
+
+        source = r.chunk.metadata.get("filename", r.chunk.doc_id)
+        attrs = format_front_matter_text(front, max_items=12, max_len=max_len)
+        if not attrs:
+            continue
+
+        lines.append(f"- {source}: {attrs}")
+        if len(lines) >= max_docs:
+            break
+
+    return "\n".join(lines)
 
 def get_case_gold_sources(tc) -> List[Dict]:
     if getattr(tc, "gold_sources", None):
@@ -1706,17 +1754,21 @@ class RAG:
                     print(f"      属性: {attrs}")
                 print(f"      内容: {r.chunk.content[:100]}...")
 
+        # 关键补丁1：把 front matter JSON 明确放入上下文
         context_parts = []
         for i, r in enumerate(results, 1):
             source = r.chunk.metadata.get("filename", "未知")
             header = r.chunk.header_context
             attrs = format_chunk_attrs(r.chunk.metadata, max_items=20, max_len=400)
+            front_json = front_matter_json_text(r.chunk.metadata, max_len=1200)
 
             context_entry = f"[文档{i}] (来源: {source}, 相关度: {r.score:.2f})"
             if header:
                 context_entry += f"\n章节: {header}"
             if attrs:
-                context_entry += f"\n属性: {attrs}"
+                context_entry += f"\n属性摘要: {attrs}"
+            if front_json:
+                context_entry += f"\n前置元数据(JSON):\n{front_json}"
             context_entry += f"\n内容:\n{r.chunk.content}"
             context_parts.append(context_entry)
 
@@ -1729,30 +1781,48 @@ class RAG:
         if verbose:
             print("\n[步骤2] 调用 LLM 生成回答...")
 
+        # 关键补丁2：明确要求模型不要忽略元数据
         messages = [
             {
                 "role": "system",
                 "content": """你是一个专业的AI助手。请根据提供的上下文信息回答用户问题。
-规则：
-1. 仔细阅读所有提供的上下文信息
-2. 基于上下文内容回答问题，优先引用相关度高的文档
-3. 如果多个文档包含相关信息，请综合总结
-4. 如果上下文中有明确的章节信息，可以在回答中引用
-5. 如果上下文中带有属性信息（如 front matter 元数据），也可以据此回答或说明
-6. 如果确实没有相关信息，请说明"根据提供的文档，没有找到相关信息"
-7. 不要编造上下文中没有的内容"""
+    规则：
+    1. 只能基于上下文回答，不要编造
+    2. 优先参考相关度高的文档
+    3. 如果多个文档都相关，请综合总结
+    4. 如果上下文中有章节信息，可以引用章节
+    5. 如果上下文中包含 front matter / 属性 / 元数据，并且与问题相关，必须明确写出字段和值
+    6. 如果问题询问负责人、模块、优先级、标签、状态、版本、适用范围等属性，优先依据元数据回答
+    7. 如果正文和元数据都相关，两者都要体现，不要只回答正文
+    8. 不要忽略上下文里的“前置元数据(JSON)”部分
+    9. 如果确实没有相关信息，请回答：根据提供的文档，没有找到相关信息
+
+    请尽量使用如下结构：
+    答案：
+    依据：
+    相关属性："""
             },
             {
                 "role": "user",
                 "content": f"""请根据以下上下文回答问题。
-上下文信息：
-{context}
-问题：{question}
-请回答："""
+
+    上下文信息：
+    {context}
+
+    问题：{question}
+
+    请回答："""
             }
         ]
 
         answer = self.llm.chat(messages)
+
+        # 关键补丁3：程序层面追加 front matter 摘要，确保用户一定能看到
+        fm_summary = build_result_front_matter_summary(results, max_docs=min(3, len(results)))
+        if fm_summary:
+            answer = answer.rstrip()
+            answer += "\n\n【命中文档属性】\n" + fm_summary
+
         return answer, results
 
     def interactive(self):
