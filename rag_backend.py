@@ -71,6 +71,20 @@ def derive_embedding_url() -> Optional[str]:
     return None
 
 
+def derive_reranker_url() -> Optional[str]:
+    configured = os.environ.get("RERANKER_URL") or os.environ.get("RERANKER_API_URL")
+    if configured:
+        return configured
+    if not LLM_URL:
+        return None
+
+    llm_url = LLM_URL.rstrip("/")
+    suffix = "/chat/completions"
+    if llm_url.endswith(suffix):
+        return llm_url[:-len(suffix)] + "/rerank"
+    return None
+
+
 EMBEDDING_URL = derive_embedding_url()
 EMBEDDING_KEY = os.environ.get("EMBEDDING_KEY") or os.environ.get("EMBEDDING_API_KEY") or LLM_KEY
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-m3")
@@ -79,10 +93,20 @@ EMBEDDING_BATCH_SIZE = int(os.environ.get("EMBEDDING_BATCH_SIZE", "8"))
 EMBEDDING_TIMEOUT = int(os.environ.get("EMBEDDING_TIMEOUT", "120"))
 EMBEDDING_DIMENSIONS = os.environ.get("EMBEDDING_DIMENSIONS")
 
+RERANKER_URL = derive_reranker_url()
+RERANKER_KEY = os.environ.get("RERANKER_KEY") or os.environ.get("RERANKER_API_KEY") or LLM_KEY
+RERANKER_MODEL = os.environ.get("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
+RERANKER_TIMEOUT = int(os.environ.get("RERANKER_TIMEOUT", "120"))
+RERANKER_ENABLED = os.environ.get("RERANKER_ENABLED", "true").lower() in {"1", "true", "yes", "y"}
+
 # 知识库配置
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "512"))
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "50"))
-TOP_K = int(os.environ.get("TOP_K", "10"))
+HYBRID_TOP_K = int(os.environ.get(
+    "HYBRID_TOP_K",
+    os.environ.get("RERANK_CANDIDATE_TOP_K", "20")
+))
+TOP_K = int(os.environ.get("TOP_K", "5"))
 
 # 混合检索权重配置
 VECTOR_WEIGHT = float(os.environ.get("VECTOR_WEIGHT", "0.6"))
@@ -424,11 +448,13 @@ class SearchResult:
     bm25_score: float = 0.0
     metadata_score: float = 0.0
     filename_boost: float = 0.0
+    rerank_score: float = 0.0
 
 
 class RAGPipelineState(TypedDict, total=False):
     question: str
     top_k: int
+    candidate_top_k: int
     verbose: bool
     results: List[SearchResult]
     context: str
@@ -1229,6 +1255,73 @@ class EmbeddingClient:
 
 
 # ============================================================
+# Reranker 客户端
+# ============================================================
+class RerankerClient:
+    def __init__(self):
+        self.url = RERANKER_URL
+        self.model = RERANKER_MODEL
+        self.timeout = RERANKER_TIMEOUT
+        self.enabled = RERANKER_ENABLED and bool(self.url)
+        self.headers = {"Content-Type": "application/json"}
+        if RERANKER_KEY:
+            self.headers["Authorization"] = RERANKER_KEY
+
+    def rerank(self, query: str, documents: List[str], top_k: int = None) -> Optional[List[Tuple[int, float]]]:
+        if not self.enabled or not documents:
+            return None
+
+        payload = {
+            "model": self.model,
+            "query": query,
+            "documents": documents
+        }
+        if top_k:
+            payload["top_n"] = top_k
+
+        try:
+            resp = requests.post(self.url, headers=self.headers, json=payload, timeout=self.timeout)
+            resp.raise_for_status()
+            return self._parse_rerank_response(resp.json(), len(documents))
+        except Exception as e:
+            print(f"Reranker 错误: {e}")
+            return None
+
+    @staticmethod
+    def _parse_rerank_response(data: Dict, doc_count: int) -> List[Tuple[int, float]]:
+        rows = data.get("results")
+        if rows is None:
+            rows = data.get("data")
+
+        if isinstance(rows, list):
+            parsed = []
+            for fallback_index, item in enumerate(rows):
+                if isinstance(item, dict):
+                    index = item.get(
+                        "index",
+                        item.get("document_index", item.get("rank", item.get("id", fallback_index)))
+                    )
+                    score = item.get(
+                        "relevance_score",
+                        item.get("relevanceScore", item.get("score", item.get("rerank_score", 0.0)))
+                    )
+                else:
+                    index = fallback_index
+                    score = item
+
+                index = int(index)
+                if 0 <= index < doc_count:
+                    parsed.append((index, float(score)))
+            return parsed
+
+        scores = data.get("scores")
+        if isinstance(scores, list):
+            return [(i, float(score)) for i, score in enumerate(scores[:doc_count])]
+
+        raise RuntimeError(f"未知 Reranker API 响应格式: {list(data.keys())}")
+
+
+# ============================================================
 # LLM 客户端
 # ============================================================
 class LLMClient:
@@ -1271,9 +1364,11 @@ class HybridVectorStore:
     """混合检索向量存储：numpy 向量矩阵 + BM25 + 元数据/文件名增强"""
 
     def __init__(self, embedding_client: EmbeddingClient,
+                 reranker_client: RerankerClient = None,
                  vector_weight: float = 0.6,
                  bm25_weight: float = 0.4):
         self.client = embedding_client
+        self.reranker = reranker_client
         self.chunks: List[Chunk] = []
         self.vectors: Optional[np.ndarray] = None
         self.bm25 = BM25Retriever()
@@ -1473,11 +1568,99 @@ class HybridVectorStore:
         if DEBUG:
             print(f"向量矩阵: {self.vectors.shape}")
 
-    def search(self, query: str, top_k: int = 5, verbose: bool = True) -> List[SearchResult]:
+    def _select_ranked_indices(self,
+                               ranked_indices: List[int],
+                               preferred_docs: set,
+                               top_k: int) -> List[int]:
+        if not preferred_docs or top_k <= 1:
+            return ranked_indices[:top_k]
+
+        selected = []
+        selected_set = set()
+        preferred_quota = int(math.ceil(top_k * self.preferred_doc_max_ratio))
+        preferred_quota = max(1, min(preferred_quota, top_k - 1))
+
+        for idx in ranked_indices:
+            if len(selected) >= preferred_quota:
+                break
+            filename = self.chunks[idx].metadata.get("filename", self.chunks[idx].doc_id)
+            if filename in preferred_docs:
+                selected.append(idx)
+                selected_set.add(idx)
+
+        for idx in ranked_indices:
+            if len(selected) >= top_k:
+                break
+            if idx in selected_set:
+                continue
+            filename = self.chunks[idx].metadata.get("filename", self.chunks[idx].doc_id)
+            if filename not in preferred_docs:
+                selected.append(idx)
+                selected_set.add(idx)
+
+        for idx in ranked_indices:
+            if len(selected) >= top_k:
+                break
+            if idx in selected_set:
+                continue
+            selected.append(idx)
+            selected_set.add(idx)
+
+        return selected[:top_k]
+
+    def _rerank_indices(self,
+                        query: str,
+                        candidate_indices: List[int],
+                        top_k: int,
+                        verbose: bool) -> Tuple[List[int], Dict[int, float]]:
+        if not self.reranker or not self.reranker.enabled or not candidate_indices:
+            return candidate_indices[:top_k], {}
+
+        documents = [self.index_texts[idx] for idx in candidate_indices]
+        reranked = self.reranker.rerank(query, documents, top_k=top_k)
+        if not reranked:
+            return candidate_indices[:top_k], {}
+
+        rerank_scores = {}
+        ordered_indices = []
+        seen = set()
+
+        for local_idx, score in reranked:
+            if local_idx < 0 or local_idx >= len(candidate_indices):
+                continue
+            global_idx = candidate_indices[local_idx]
+            if global_idx in seen:
+                continue
+            rerank_scores[global_idx] = score
+            ordered_indices.append(global_idx)
+            seen.add(global_idx)
+            if len(ordered_indices) >= top_k:
+                break
+
+        for global_idx in candidate_indices:
+            if len(ordered_indices) >= top_k:
+                break
+            if global_idx not in seen:
+                ordered_indices.append(global_idx)
+                seen.add(global_idx)
+
+        if DEBUG and verbose:
+            print(f"[重排] Reranker 输入 {len(candidate_indices)} 个候选，返回 {len(ordered_indices)} 个结果")
+
+        return ordered_indices[:top_k], rerank_scores
+
+    def search(self,
+               query: str,
+               top_k: int = 5,
+               candidate_top_k: int = None,
+               verbose: bool = True) -> List[SearchResult]:
         if self.vectors is None or len(self.chunks) == 0:
             if verbose:
                 print("[搜索] 向量库为空！")
             return []
+
+        top_k = max(1, int(top_k or TOP_K))
+        candidate_top_k = max(top_k, int(candidate_top_k or HYBRID_TOP_K))
 
         vector_scores = np.zeros(len(self.chunks), dtype=np.float32)
         q_vec = self.client.embed([query])
@@ -1526,44 +1709,8 @@ class HybridVectorStore:
             print(f"[搜索] 融合分数范围: {combined_scores.min():.4f} - {combined_scores.max():.4f}")
 
         ranked_indices = list(np.argsort(combined_scores)[::-1])
-
-        # 文件优先但不锁死召回
-        selected = []
-        selected_set = set()
-
-        if preferred_docs and top_k > 1:
-            preferred_quota = int(math.ceil(top_k * self.preferred_doc_max_ratio))
-            preferred_quota = max(1, min(preferred_quota, top_k - 1))
-
-            for idx in ranked_indices:
-                if len(selected) >= preferred_quota:
-                    break
-                filename = self.chunks[idx].metadata.get("filename", self.chunks[idx].doc_id)
-                if filename in preferred_docs:
-                    selected.append(idx)
-                    selected_set.add(idx)
-
-            for idx in ranked_indices:
-                if len(selected) >= top_k:
-                    break
-                if idx in selected_set:
-                    continue
-                filename = self.chunks[idx].metadata.get("filename", self.chunks[idx].doc_id)
-                if filename not in preferred_docs:
-                    selected.append(idx)
-                    selected_set.add(idx)
-
-            for idx in ranked_indices:
-                if len(selected) >= top_k:
-                    break
-                if idx in selected_set:
-                    continue
-                selected.append(idx)
-                selected_set.add(idx)
-
-            top_indices = selected[:top_k]
-        else:
-            top_indices = ranked_indices[:top_k]
+        candidate_indices = self._select_ranked_indices(ranked_indices, preferred_docs, candidate_top_k)
+        top_indices, rerank_scores = self._rerank_indices(query, candidate_indices, top_k, verbose)
 
         results = []
         for idx in top_indices:
@@ -1573,16 +1720,19 @@ class HybridVectorStore:
                 vector_score=float(vector_scores[idx]),
                 bm25_score=float(bm25_scores[idx]),
                 metadata_score=float(metadata_scores[idx]),
-                filename_boost=float(filename_boost_scores[idx])
+                filename_boost=float(filename_boost_scores[idx]),
+                rerank_score=float(rerank_scores.get(idx, 0.0))
             ))
 
         if DEBUG and verbose:
-            print(f"[搜索] 返回 {len(results)} 个结果:")
+            print(f"[搜索] 混合检索候选 {len(candidate_indices)} 个，返回 {len(results)} 个结果:")
             for i, r in enumerate(results, 1):
                 attrs = format_chunk_attrs(r.chunk.metadata, max_items=6, max_len=120)
+                display_score = r.rerank_score if r.rerank_score else r.score
                 print(
-                    f"  {i}. [综合:{r.score:.3f} V:{r.vector_score:.3f} "
-                    f"B:{r.bm25_score:.3f} M:{r.metadata_score:.3f} F:{r.filename_boost:.1f}] "
+                    f"  {i}. [排序:{display_score:.3f} 综合:{r.score:.3f} V:{r.vector_score:.3f} "
+                    f"B:{r.bm25_score:.3f} M:{r.metadata_score:.3f} "
+                    f"F:{r.filename_boost:.1f} R:{r.rerank_score:.3f}] "
                     f"{r.chunk.doc_id}"
                 )
                 if attrs:
@@ -1635,6 +1785,10 @@ class HybridVectorStore:
             "bm25_weight": self.bm25_weight,
             "chunk_size": CHUNK_SIZE,
             "chunk_overlap": CHUNK_OVERLAP,
+            "hybrid_top_k": HYBRID_TOP_K,
+            "final_top_k": TOP_K,
+            "reranker_model": RERANKER_MODEL,
+            "reranker_enabled": self.reranker.enabled if self.reranker else False,
             "index_text_mode": "content+header+metadata",
             "filename_match_boost": self.filename_match_boost,
             "metadata_match_boost": self.metadata_match_boost,
@@ -1723,9 +1877,11 @@ class RAG:
             min_chunk_chars=MIN_CHUNK_CHARS
         )
         self.embedding = EmbeddingClient()
+        self.reranker = RerankerClient()
         self.llm = LLMClient()
         self.store = HybridVectorStore(
             self.embedding,
+            reranker_client=self.reranker,
             vector_weight=VECTOR_WEIGHT,
             bm25_weight=BM25_WEIGHT
         )
@@ -1734,10 +1890,14 @@ class RAG:
         print("配置:")
         print(f"  Embedding API: {EMBEDDING_URL}")
         print(f"  Embedding Model: {EMBEDDING_MODEL}")
+        print(f"  Reranker API: {RERANKER_URL}")
+        print(f"  Reranker Model: {RERANKER_MODEL}")
+        print(f"  Reranker Enabled: {self.reranker.enabled}")
         print(f"  LLM: {LLM_URL}")
         print(f"  Chunk Size: {CHUNK_SIZE}")
         print(f"  Min Chunk Chars: {MIN_CHUNK_CHARS}")
-        print(f"  Top K: {TOP_K}")
+        print(f"  Hybrid Candidate Top K: {HYBRID_TOP_K}")
+        print(f"  Final Top K: {TOP_K}")
         print(f"  混合检索: 向量权重={VECTOR_WEIGHT}, BM25权重={BM25_WEIGHT}")
         print(f"  文件名命中Boost: {FILENAME_MATCH_BOOST}")
         print(f"  元数据Boost: {METADATA_MATCH_BOOST}")
@@ -1773,12 +1933,18 @@ class RAG:
     def _pipeline_retrieve(self, state: RAGPipelineState) -> RAGPipelineState:
         question = state["question"]
         top_k = state.get("top_k") or TOP_K
+        candidate_top_k = state.get("candidate_top_k") or HYBRID_TOP_K
         verbose = state.get("verbose", True)
 
         if verbose:
-            print("\n[步骤1] 混合检索...")
+            print("\n[步骤1] 混合检索 + 重排...")
 
-        results = self.store.search(question, top_k=top_k, verbose=verbose)
+        results = self.store.search(
+            question,
+            top_k=top_k,
+            candidate_top_k=candidate_top_k,
+            verbose=verbose
+        )
         if not results:
             return {
                 **state,
@@ -1795,10 +1961,12 @@ class RAG:
     def _print_retrieved_results(self, results: List[SearchResult]):
         print(f"\n检索到 {len(results)} 个相关片段:")
         for i, r in enumerate(results, 1):
+            display_score = r.rerank_score if r.rerank_score else r.score
             print(
-                f"\n  [{i}] 综合分数: {r.score:.4f} "
-                f"(向量: {r.vector_score:.4f}, BM25: {r.bm25_score:.4f}, "
-                f"元数据: {r.metadata_score:.4f}, 文件Boost: {r.filename_boost:.1f})"
+                f"\n  [{i}] 排序分数: {display_score:.4f} "
+                f"(综合: {r.score:.4f}, 向量: {r.vector_score:.4f}, BM25: {r.bm25_score:.4f}, "
+                f"元数据: {r.metadata_score:.4f}, 文件Boost: {r.filename_boost:.1f}, "
+                f"重排: {r.rerank_score:.4f})"
             )
             print(f"      来源: {r.chunk.metadata.get('filename', '未知')}")
             if r.chunk.header_context:
@@ -1816,7 +1984,8 @@ class RAG:
             attrs = format_chunk_attrs(r.chunk.metadata, max_items=20, max_len=400)
             front_json = front_matter_json_text(r.chunk.metadata, max_len=1200)
 
-            context_entry = f"[文档{i}] (来源: {source}, 相关度: {r.score:.2f})"
+            relevance_score = r.rerank_score if r.rerank_score else r.score
+            context_entry = f"[文档{i}] (来源: {source}, 相关度: {relevance_score:.2f})"
             if header:
                 context_entry += f"\n章节: {header}"
             if attrs:
@@ -1926,11 +2095,25 @@ class RAG:
     def load_index(self, save_dir: str):
         self.store.load(save_dir)
 
-    def retrieve(self, question: str, top_k: int = None, verbose: bool = True) -> List[SearchResult]:
+    def retrieve(self,
+                 question: str,
+                 top_k: int = None,
+                 candidate_top_k: int = None,
+                 verbose: bool = True) -> List[SearchResult]:
         top_k = top_k or TOP_K
-        return self.store.search(question, top_k=top_k, verbose=verbose)
+        candidate_top_k = candidate_top_k or HYBRID_TOP_K
+        return self.store.search(
+            question,
+            top_k=top_k,
+            candidate_top_k=candidate_top_k,
+            verbose=verbose
+        )
 
-    def query(self, question: str, top_k: int = None, verbose: bool = True) -> Tuple[str, List[SearchResult]]:
+    def query(self,
+              question: str,
+              top_k: int = None,
+              candidate_top_k: int = None,
+              verbose: bool = True) -> Tuple[str, List[SearchResult]]:
         if verbose:
             print("\n" + "-" * 40)
             print(f"问题: {question}")
@@ -1940,10 +2123,12 @@ class RAG:
             return "知识库为空，请先加载文档。", []
 
         top_k = top_k or TOP_K
+        candidate_top_k = candidate_top_k or HYBRID_TOP_K
 
         state = self.pipeline.invoke({
             "question": question,
             "top_k": top_k,
+            "candidate_top_k": candidate_top_k,
             "verbose": verbose
         })
         return state.get("answer", ""), state.get("results", [])
@@ -1997,10 +2182,15 @@ class RAG:
 
                     elif cmd == "/search":
                         if arg:
-                            results = self.store.search(arg, TOP_K, verbose=True)
+                            results = self.store.search(
+                                arg,
+                                top_k=TOP_K,
+                                candidate_top_k=HYBRID_TOP_K,
+                                verbose=True
+                            )
                             print(f"\n搜索 '{arg}' 的结果:")
                             for i, r in enumerate(results, 1):
-                                print(f"\n{i}. [综合:{r.score:.3f} V:{r.vector_score:.3f} B:{r.bm25_score:.3f} M:{r.metadata_score:.3f} F:{r.filename_boost:.1f}]")
+                                print(f"\n{i}. [综合:{r.score:.3f} V:{r.vector_score:.3f} B:{r.bm25_score:.3f} M:{r.metadata_score:.3f} F:{r.filename_boost:.1f} R:{r.rerank_score:.3f}]")
                                 print(f"   来源: {r.chunk.doc_id}")
                                 attrs = format_chunk_attrs(r.chunk.metadata, max_items=6, max_len=180)
                                 if attrs:
@@ -2049,6 +2239,10 @@ class RAG:
                             print(f"  向量矩阵: {self.store.vectors.shape}")
                         print(f"  BM25词汇量: {len(self.store.bm25.idf)}")
                         print(f"  检索权重: 向量={self.store.vector_weight}, BM25={self.store.bm25_weight}")
+                        print(f"  混合检索候选TopK: {HYBRID_TOP_K}")
+                        print(f"  最终TopK: {TOP_K}")
+                        print(f"  Reranker: {'启用' if self.reranker.enabled else '未启用'}")
+                        print(f"  Reranker模型: {self.reranker.model}")
                         print(f"  文件名Boost: {self.store.filename_match_boost}")
                         print(f"  元数据Boost: {self.store.metadata_match_boost}")
                         print(f"  文件优先上限: {self.store.preferred_doc_max_ratio}")
